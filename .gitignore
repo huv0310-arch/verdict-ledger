@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+*.pyo
+.v2_state/
+.speak_state/
+.env
+data/
+*.bak
+*.log

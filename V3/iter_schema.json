@@ -1,0 +1,68 @@
+{
+  "_说明": [
+    "V3 迭代账（jsonl，一行一条记录，UTF-8，追加不改写）。",
+    "两种记录形状：shape_v1（一轮一记，数组字段为主）与 shape_v2（一动作一记，字段全标量）。",
+    "新记录优先用 shape_v2；读账时两种都要认。",
+    "本文件只给结构与假数据示例，真实记录不入库。"
+  ],
+  "file": "iter_template.jsonl",
+  "required_common": {
+    "ts": "时间戳，字符串，两种格式都认：ISO 分钟精度（2026-01-01T08:00）或「YYYY-MM-DD HH:MM:SS」",
+    "round": "轮次，正整数"
+  },
+  "shape_v1": {
+    "description": "一轮一记：这一轮看到了什么限制、动了什么、怎么验的、还欠什么。",
+    "fields": {
+      "agent": "记账方标识（假数据示例用 agent-a）",
+      "topic": "本轮主题，一句话",
+      "limits": "本轮看到的限制，字符串数组",
+      "limits_ref": "回指的限制标识，字符串数组",
+      "iterated": "本轮改动，字符串数组",
+      "tests": "怎么验的，字符串数组",
+      "verified": "验证结论，字符串",
+      "pending": "还欠什么，字符串数组或单字符串",
+      "dispatched": "派给谁跟进，字符串数组",
+      "next": "下一步，字符串数组或单字符串",
+      "backup": "改动前的备份件标识，字符串"
+    },
+    "required": ["ts", "round", "agent", "topic"],
+    "example": {
+      "ts": "2026-01-01T08:00",
+      "round": 1,
+      "agent": "agent-a",
+      "topic": "示例主题（假数据）",
+      "limits": ["示例限制甲", "示例限制乙"],
+      "iterated": ["示例改动一条"],
+      "tests": ["示例验证一条"],
+      "verified": "示例：自检全绿",
+      "pending": ["示例待办一条"]
+    }
+  },
+  "shape_v2": {
+    "description": "一动作一记：一个限制对一个动作，带验证与边界。",
+    "fields": {
+      "actor": "动作方标识（假数据示例用 agent-a）",
+      "limit": "对应哪条限制，一句话",
+      "action": "做了什么，含具体口径",
+      "verify": "怎么验的、结果如何",
+      "boundary": "这条改动防不住什么，照实写",
+      "root_cause": "根因（可选）",
+      "judgment": "判决口径（可选）",
+      "rule": "沉淀成的规则（可选）",
+      "lesson": "教训（可选）",
+      "note": "备注（可选）",
+      "file": "涉及的文件（可选）",
+      "future": "留给下一步（可选）"
+    },
+    "required": ["ts", "round", "actor", "limit", "action", "verify"],
+    "example": {
+      "ts": "2026-01-01 08:00:00",
+      "round": 2,
+      "actor": "agent-a",
+      "limit": "示例限制（假数据）",
+      "action": "示例改动：把某个默认值改成环境变量可配",
+      "verify": "示例验证：沙箱跑三遍结果一致",
+      "boundary": "示例边界：并发场景未覆盖"
+    }
+  }
+}

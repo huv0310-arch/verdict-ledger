@@ -1,0 +1,27 @@
+# 收款地址归属证明（payout address attestation）
+
+## 声明
+
+- 收款地址：`0x97Cd18B8bBB629b17675D868259eA84C0A2A5A9c`（任意 EVM 兼容链通用）
+- 所属仓库：https://github.com/huv0310-arch/verdict-ledger
+- 所属账号：https://github.com/huv0310-arch
+- 签发日期：2026-11-07
+
+## 怎么核验（三步，全部公开可查，无需信任我们）
+
+1. **仓库归属**：本文件位于上述仓库 `docs/` 下，随仓库提交；GitHub 账号拥有者可查，提交时间戳公开。
+2. **账号公钥指纹**：`github.com/huv0310-arch` 的 SSH 公钥页（Settings → SSH keys）显示指纹
+   `SHA256:z/Un3+ksLMn+dWwpNM5JyiRO8s9GFTz6e6U1suaYAP4`；
+   本地复核：`ssh-keygen -y -f <私钥> | ssh-keygen -l -E sha256 -f -`。
+3. **逐字节比对**：把上面地址字符串与任何打款记录比对，一致即认。
+
+## 为什么不做链上签名
+
+GitHub 的 SSH 密钥（ed25519）与 EVM 收款地址（secp256k1）**不同源，密码学上无法互签**。
+归属绑定因此靠三件公开事实：仓库归属 + 账号公钥指纹 + 本文件。
+三者都可由第三方独立复核；若未来出现能自证的跨链签名方案，本文件将更新并注明版本。
+
+## 边界
+
+- 本文件只声明地址归属，不构成要约、不构成投资建议。
+- 除本仓库 `docs/` 内的更新外，任何渠道对该地址的"官方"声称均与本项目无关。

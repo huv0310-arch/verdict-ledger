@@ -1,0 +1,20 @@
+{
+  "_说明": [
+    "V2 标准件 MCP 工具档配置样例 —— 只提供样例，宿主 config.yaml 默认不改（改配置需发布人确认）。",
+    "用法：把下面 mcp_servers 段合并进宿主 config.yaml（YAML 写法同形，缩进 2 格），重启宿主。",
+    "合并后工具表出现：mcp_v2_v2_record / mcp_v2_v2_borrow（按 mcp_<服务名>_<工具名> 命名）。",
+    "前提：v2_mcp_server.py 与 v2_gate.py / v2_borrow.py / ctx_fp.py / v2_gate/ledger.py 同目录；python -m py_compile 全过 + --selftest 绿。",
+    "账本默认落 %USERPROFILE%\\.hermes\\state\\v2\\（可用 V2_STATE_DIR 改指）；宿主若不透传 USERPROFILE，给条目加 env.USERPROFILE。",
+    "卸载 = 删该配置条目 + 重启；账本不动。"
+  ],
+  "mcp_servers": {
+    "v2": {
+      "command": "python",
+      "args": [
+        "<REPO>/V2/v2_mcp_server.py"
+      ],
+      "timeout": 60,
+      "connect_timeout": 30
+    }
+  }
+}
