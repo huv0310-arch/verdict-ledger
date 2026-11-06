@@ -45,6 +45,7 @@ import os
 import uuid
 import threading
 import time
+import sys
 
 # ── 三值 ──────────────────────────────────────────────────────
 YES = 1
@@ -61,7 +62,13 @@ def addr(text):
     内部那个 _make_key 是私货，外人想算同款地址只能去抄 —— 抄私货等于把
     内部实现当了 API（外部评审A 2026-10-31 报的正是这条）。这里给一个正式的。
     """
-    from ganglion import _make_key
+    try:
+        from ganglion import _make_key
+    except ImportError as e:
+        raise ImportError(
+            "addr() 需要外挂的反射标准件 ganglion.py（独立仓库，本发布包不携带）："
+            "请把 ganglion.py 与本文件装在同一目录（或加入 PYTHONPATH）后再调用。"
+        ) from e
     return _make_key(text)
 
 
@@ -822,22 +829,22 @@ class Ledger:
     # ══════════ 第三把刀：按钟忘（2026-11-03）══════════
     # prune() 按"判过没人翻"忘，判据与 ttl 无关 —— 一本每节只判一圈的账跑一次 0 刀。
     # 可是 ttl 全是 3600、节节早出窗，账面 124/129 超期：缺的是这把按钟扫的。
-    EXPIRED_ARCHIVE = os.path.join(
-        os.environ.get("V2_STATE_DIR") or os.path.join(
-            os.environ.get("USERPROFILE", os.path.expanduser("~")),
-            ".hermes", "state", "v2"),  # 账目录可配
-        "expired.jsonl")
+    # 归档位置一个默认值都不给（通用件不许写死业务路径）：不给 archive 就不动刀。
 
-    def sweep_ttl(self, now=None):
+    def sweep_ttl(self, now=None, archive=None):
         """过窗的节：归档在前，再原地变墓碑（与 prune() 同口径，圈号一个字不许乱）。
 
-        归档：原节完整 JSON 逐行追加进 expired.jsonl（只追加不覆盖）——
-        先留底再改，改没了就再也找不回原样了。
+        归档：原节完整 JSON 逐行追加进 archive（只追加不覆盖）——
+        先留底再改，改没了就再也找不回原样了。**不给归档位置就不动刀**：
+        留不下底就不写，返回 0（一个默认值都不给）；真扫出过窗的节才打印
+        一句吵给日志看 —— 没目标本来就是 0 刀，无话可说。
         墓碑：字段完全复用 prune() 那套（nid/key/round 留着、verdict=None、ttl=None），
         reason 写"已过窗（ttl 超期）"。不整条抽走：抽走会把后面的圈号往前挪。
 
         绝不碰 journal.jsonl（追加型正本，宿主靠 _journal_upto/_journal_ino 消费它）。
-        fail-open：任何异常吞掉并打印，返回 0 —— 调用方 record 因这一刀断掉才是大事。
+        **绝不抛**：不给 archive → 返回 0；跑起来出的错同样 fail-open ——
+        吞掉打印返回 0。调用方 record 把这把刀夹在 append 和 save 中间的前提就是
+        「内部 fail-open，绝不抛」；参数错只能吵给日志看，不能炸在 try 外面。
         """
         try:
             now = self._clock() if now is None else now
@@ -863,8 +870,16 @@ class Ledger:
                         targets.append((k, i, n))
             if not targets:
                 return 0
+            if not archive:
+                # 归档位置一个默认值都不给 → 不动刀。打印走 stderr：stdio 的
+                # MCP 子进程把 stdout 当 JSON-RPC 通道，混进一行就是
+                # "Expecting value"（自测实测）；且只在真有过窗节时吵 ——
+                # 无目标 = 0 刀，没什么可吵的。
+                print("[sweep_ttl] 没给归档位置（archive=<.jsonl 路径>）：先归档后动刀，"
+                      "留不下底就不写 —— 这一刀不扫，调用不断。", file=sys.stderr)
+                return 0
             # ① 归档在前：一节一行完整原样，只追加不覆盖。
-            arc = self.EXPIRED_ARCHIVE
+            arc = archive
             d = os.path.dirname(arc)
             if d:
                 os.makedirs(d, exist_ok=True)
@@ -886,6 +901,7 @@ class Ledger:
                     "ts": n.get("ts"), "round": n.get("round"),
                     "value_score": None, "ctx_fp": "", "hits": 0,
                     "last_hit": None, "borrows": [], "ttl": None,
+                    "writer": n.get("writer"),        # 署名不丢：不署名不许落账
                 }
                 swept += 1
             if swept:
@@ -1594,7 +1610,14 @@ class LedgerGanglion:
             raise ValueError(
                 "LedgerGanglion 会借账，借票必须有地方落：给 journal=<流水路径>，"
                 "或明写 journal=False（只许单进程）")
-        from ganglion import Ganglion, _make_key
+        try:
+            from ganglion import Ganglion, _make_key
+        except ImportError as e:
+            raise ImportError(
+                "LedgerGanglion 需要外挂的反射标准件 ganglion.py（独立仓库，本发布包不携带）："
+                "请把 ganglion.py 与本文件装在同一目录（或加入 PYTHONPATH）后再用；"
+                "核心账本不依赖它，只记只借可直接用 Ledger。"
+            ) from e
         self._make_key = _make_key
         self.journal = journal
         self.ledger = ledger if ledger is not None else Ledger()
