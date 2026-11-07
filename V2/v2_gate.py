@@ -18,7 +18,7 @@ STATE_DIR = os.environ.get("V2_STATE_DIR") or os.path.join(
 JOURNAL = os.path.join(STATE_DIR, "journal.jsonl")
 SNAP = os.path.join(STATE_DIR, "ledger.json")
 WRITER = os.environ.get("V2_WRITER", "v2-front-door")
-__version__ = "2.0"             # 对外发布 tag v2.0；沿革见 git log / CHANGELOG（对外发布时另附）
+__version__ = "3.1"             # 对外发布 tag v3.1（2026-11-07）；沿革见 git log / CHANGELOG（对外发布时另附）
 TTL = 3600   # 旧世代（v1）统一窗，仅历史节自带此值，本文件不再写入
 
 _Ledger = None
@@ -218,6 +218,133 @@ def verify_chain():
         return {"ok": False, "lines": -1, "chained": -1, "break_at": None, "why": str(e)[:100]}
 
 
+# ══════════ 链头锚定（v3.1）：给「链头」留一个能对账的凭据 ══════════
+# 影子链防的是「改行 / 删行 / 单侧截断」—— 全量重算当场断。
+# 防不住的是：把 journal 和 .chain **一起**从尾部截掉几行 —— 剩下的链条依然自洽。
+# 锚定 = 把某一刻的链头（条数 + 摘要）追加写进一个**独立的锚文件**（append-only），
+# 校验时拿本地链头去对锚记录：本地比锚旧 = 尾巴被截了。
+# 边界照实说：锚与账同机同盘时，防的是截断与残缺；流水 + 链 + 锚一起改的共谋防不住，
+# 外部第三方时间戳锚定（把链头发到链外）还没做 —— 账被当证据用的时候才需要那一层。
+ANCHORS = os.environ.get("V2_ANCHORS") or os.path.join(STATE_DIR, "anchors.jsonl")
+ALGO = "sha256-chain"
+
+
+def _anchor_path(path=None):
+    return path or ANCHORS
+
+
+def _journal_rows():
+    """读 journal 的非空行（只读）。"""
+    rows = []
+    if not os.path.exists(JOURNAL):
+        return rows
+    with open(JOURNAL, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+    return rows
+
+
+def _head_of(rows, upto=None):
+    """从首行起重算链上哈希：upto = 只算前 upto 行（默认整份）。返回 (条数, 十六进制)。"""
+    prev, n = "", 0
+    for row in (rows if upto is None else rows[:upto]):
+        prev = _line_h(prev, row)
+        n += 1
+    return n, prev
+
+
+def chain_head():
+    """只读：当前链头摘要 —— 条数 + 链上最后一个哈希 + 时刻。不改账、不写盘。"""
+    try:
+        rows = _journal_rows()
+        n, head = _head_of(rows)
+        chain = []
+        if os.path.exists(_CHAIN):
+            with open(_CHAIN, encoding="utf-8") as f:
+                chain = [json.loads(x) for x in f if x.strip()]
+        res = {"ok": True, "algo": ALGO, "lines": n, "chained": len(chain),
+               "head": ("sha256:" + head) if head else "", "ts": round(time.time(), 3), "why": ""}
+        if head and chain and chain[-1].get("h") != head:
+            res["ok"] = False
+            res["why"] = "影子链最后一行与 journal 重算的链头对不上（先跑 verify 看断在哪）"
+        return res
+    except Exception as e:
+        return {"ok": False, "algo": ALGO, "lines": -1, "chained": -1,
+                "head": "", "why": str(e)[:120]}
+
+
+def anchor(path=None):
+    """把当前链头**追加**写进独立锚文件（append-only：{ts, count, head, algo}）。
+
+    只写锚文件：journal 与 .chain 一个字节不改（这是只读接口的那半边）。
+    链头读不出来 / 账 0 行就不写 —— 没得锚就不假装锚过。fail-open 同本文件其余接口。
+    """
+    ap = _anchor_path(path)
+    try:
+        h = chain_head()
+        if not h.get("ok"):
+            return {"ok": False, "path": ap, "why": h.get("why") or "链头读不出来"}
+        if not h.get("lines"):
+            return {"ok": False, "path": ap, "why": "账 0 行：没有可锚的链头"}
+        rec = {"ts": h["ts"], "count": h["lines"], "head": h["head"], "algo": ALGO}
+        d = os.path.dirname(ap)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        with open(ap, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        out = dict(rec)
+        out.update({"ok": True, "path": ap, "why": "链头已追加进锚文件"})
+        return out
+    except Exception as e:
+        return {"ok": False, "path": ap, "why": str(e)[:120]}
+
+
+def verify_against(path=None):
+    """拿本地链头对锚记录 —— 抓**尾部被截断**（journal + .chain 一起截也抓得到）。
+
+    口径（三问，缺一不可）：
+      · 锚文件不存在 / 是空的 → ok=False：没得比就是没验，绝不报绿；
+      · 本地行数 < 最新锚的行数 → 尾部被截断（truncated=True）；
+      · 本地行数 >= 锚行数 → 把本地流水算到**锚那一行的位置**，链上哈希必须等于锚记的
+        head（对得上 = 锚点之前的账一个字没被动过；账在锚之后继续长是正常的）。
+    锚只钉到锚那一条：锚之后的行靠更新的锚与影子链管。
+    """
+    ap = _anchor_path(path)
+    try:
+        if not os.path.exists(ap):
+            return {"ok": False, "path": ap,
+                    "why": "锚文件不存在：没有可比对的锚（先 anchor 记一笔）"}
+        with open(ap, encoding="utf-8") as f:
+            anchors = [json.loads(x) for x in f if x.strip()]
+        if not anchors:
+            return {"ok": False, "path": ap, "why": "锚文件是空的：没有可比对的锚"}
+        a = anchors[-1]
+        cnt = int(a.get("count") or 0)
+        rows = _journal_rows()
+        local = len(rows)
+        base = {"path": ap, "lines": local, "anchor": a, "truncated": False}
+        if local < cnt:
+            base.update({"ok": False, "truncated": True,
+                         "why": f"尾部被截断：本地 {local} 行 < 锚记录 {cnt} 行"
+                                f"（锚于 {a.get('ts')}）"})
+            return base
+        n, head = _head_of(rows, cnt)
+        head = "sha256:" + head if head else ""
+        if head != a.get("head"):
+            base.update({"ok": False, "local_head": head,
+                         "why": f"链头与锚不符：本地算到第 {n} 行的链头对不上锚"
+                                f"（锚那一段的账被动过？）"})
+            return base
+        tail = local - cnt
+        base.update({"ok": True, "head": chain_head().get("head", ""),
+                     "why": "链头与锚一致" + (f"（锚之后账继续长了 {tail} 行）" if tail else "")})
+        return base
+    except Exception as e:
+        return {"ok": False, "path": ap, "why": str(e)[:120]}
+
+
 def overturn(platform, msg, new_verdict, why, ctx_fp=""):
     """翻案：对同 key 追加一条反转判决——历史不删只盖章：旧行还在，新行 reason 带
     「[翻案] v=N round=R old=O why=...」，翻案信息全在 reason 里，ledger 一行不改。
@@ -398,7 +525,33 @@ def stats():
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "stats":
+    def _after(argv, flag):
+        """取 --flag 后面那个值（没有就 None）。"""
+        try:
+            i = argv.index(flag)
+        except ValueError:
+            return None
+        return argv[i + 1] if i + 1 < len(argv) else None
+
+    _args = sys.argv[1:]
+    if _args and _args[0] == "stats":
         print(json.dumps(stats(), ensure_ascii=False))
+    elif _args and _args[0] == "chain-head":
+        _r = chain_head()
+        print(json.dumps(_r, ensure_ascii=False))
+        sys.exit(0 if _r.get("ok") else 1)
+    elif _args and _args[0] == "anchor":
+        # 可选：anchor <锚文件路径>（默认 V2_ANCHORS / 账目录下的 anchors.jsonl）
+        _p = _args[1] if len(_args) > 1 and not _args[1].startswith("--") else None
+        _r = anchor(_p)
+        print(json.dumps(_r, ensure_ascii=False))
+        sys.exit(0 if _r.get("ok") else 1)
+    elif _args and _args[0] == "verify":
+        # verify                       → 老口径：影子链全量重算
+        # verify --against <锚文件>    → 拿本地链头对锚，能抓尾部被截断
+        _ag = _after(_args, "--against")
+        _r = verify_against(_ag) if _ag else verify_chain()
+        print(json.dumps(_r, ensure_ascii=False))
+        sys.exit(0 if _r.get("ok") else 1)
     else:
         print(json.dumps({"ok": True, "ledger": _Ledger is not None, "dir": STATE_DIR}, ensure_ascii=False))

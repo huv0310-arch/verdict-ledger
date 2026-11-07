@@ -42,14 +42,42 @@ This repository turns those requirements into **running software**: judgments ha
 
 - **Judged right** — every judgment is one record: value (allow / block / unknown), verdict kind, situation fingerprint, timestamp; **append-only**. Think bank ledgers: errors are corrected by a red-ink reversal, the original voucher never disappears.
 - **Wrong judgments can be reversed** — a reversal is an append: the new verdict stamps over the old one, history is never deleted, **who reversed it and why stay on the record** — "what was corrected" is itself audit evidence.
-- **Nothing was tampered with** — the journal rides with a hash-chain shadow file, so edited, truncated, or deleted lines are caught by full recomputation. Honest boundary: this defends against unilateral tampering, not collusion that rewrites journal and chain together.
+- **Nothing was tampered with** — the journal rides with a hash-chain shadow file, so edited, truncated, or deleted lines are caught by full recomputation; **since v3.1 the chain head can be anchored**: snapshot the current chain head (line count + sha256 digest) into a separate append-only anchor file, and verification compares the local chain head against it — so a tail cut from **journal and chain together** is still caught. Honest boundary: this defends against unilateral tampering, not collusion that rewrites journal and chain together.
+
+### Chain-head anchoring (new in v3.1)
+
+The shadow chain defends against *edited / deleted / singly-truncated* lines; cut a few lines off the **end of journal and chain together** and the remainder still verifies clean — v3.1 adds the minimal fix:
+
+```bash
+python V2/v2_gate.py chain-head                     # current chain head: count + sha256 digest + time (read-only)
+python V2/v2_gate.py anchor                         # append the chain head to anchors.jsonl (append-only)
+python V2/v2_gate.py verify --against anchors.jsonl # compare local head with the anchor: a truncated tail exits 1
+```
+
+- The anchor file lives in the ledger dir by default; `V2_ANCHORS` moves it elsewhere — **kept separately, it actually counts**;
+- `anchor` writes only the anchor file, journal and shadow chain stay byte-identical; a missing or empty anchor file makes verification go red — **never fakes a pass**;
+- An anchor pins up to its own line: rows after it are covered by a newer anchor and by the shadow chain.
+
+### Timeline: the last N nodes (new in v3.1)
+
+```python
+import os
+from v2_gate import _Ledger, SNAP, JOURNAL, WRITER
+
+L = (_Ledger.load(SNAP, journal=JOURNAL, writer=WRITER, ttl=None, empty_ok=True)
+     if os.path.exists(SNAP) else _Ledger(writer=WRITER, ttl=None))
+for n in L.recent(5):            # the last 5 nodes across every address, read-only
+    print(n["key"], n["ts"], n["verdict"])
+```
+
+Three rules: every node on **every address**; sorted by the node's own clock `ts` descending (ties broken by round descending, then address ascending — the order is deterministic); **tombstones excluded**, faded nodes included, `n <= 0` returns empty, nodes without a clock are skipped.
 
 ### Where it's used
 
 - **AI agent behavior audit** — replay the whole decision chain: each judgment carries a situation fingerprint and timestamp; who judged, on what basis, was it ever reversed
 - **Content moderation / risk-control second review** — misjudgments are corrected by append; **the correction itself is on the account**; alignment drift becomes detectable and fixable instead of overwritten
 - **MCP / tool-call governance** — which permission was granted, why, for which call: tool calls turn from a *chain of trust* into a *chain of evidence*
-- **Compliance & accountability evidence** — the hash chain makes edited/truncated/deleted lines detectable afterward; and provides third-party verifiable records of *what the AI did*
+- **Compliance & accountability evidence** — the hash chain makes edited/truncated/deleted lines detectable afterward, and chain-head anchoring makes a **truncated tail** reconcile too; provides recomputable, verifiable records of *what the AI did*
 - **Automation decision trails** — every trip/pass of cron jobs, alerts, pipelines can answer *which step judged, on what basis*
 - **Trading-gate verdict records** — every allow/block on entries, exits, and stops is booked; reviews can tell *which one was the rule, which one was the itch*
 
@@ -137,8 +165,8 @@ After the run, `V2_STATE_DIR` holds `journal.jsonl` (journal) and `ledger.json` 
 
 ```
 V2/                     judgment account
-  v2_gate.py            verdict gate: book, reverse, chain-verify; ledger dir via V2_STATE_DIR
-  v2_gate/ledger.py     ledger body: append, borrow, lock, compact, age-out, archive
+  v2_gate.py            verdict gate: book, reverse, chain-verify, chain-head anchoring (chain-head / anchor / verify --against); ledger dir via V2_STATE_DIR
+  v2_gate/ledger.py     ledger body: append, borrow, lock, compact, age-out, archive, timeline recent(n)
   v2_borrow.py          read-only borrow: list / quick-scan / single read, never mutates verdicts
   v2_mcp_server.py      MCP tool table (record / borrow), self-test via --selftest
   ctx_fp.py             situation fingerprint & address key formula: both ends must share this file
@@ -157,7 +185,8 @@ docs/                   release SOP & reference stubs
   锚定与发币_立场.md     anchoring & token stance: no-issuance policy, four conventions, payout address, boundaries
 payout_address_proof.txt   payout address attestation: address, repo, public fingerprint, 3-step verification
 .github/workflows/      CI (runs locally first; not pushed = not public)
-ci/run_ci.py            local CI: compile + self-tests + sandbox smoke + de-biz scan
+ci/run_ci.py            local CI: compile + self-tests + sandbox smoke + acceptance tests + de-biz scan
+tests/                  acceptance tests (unittest, stdlib only): chain-head anchoring / recent(n) timeline / torn-tail healing
 ```
 
 ## Environment variables
@@ -166,6 +195,7 @@ ci/run_ci.py            local CI: compile + self-tests + sandbox smoke + de-biz 
 | --- | --- | --- |
 | `V2_STATE_DIR` | V2 ledger dir (journal / snapshot / archive / lock) | `%USERPROFILE%\.hermes\state\v2` |
 | `V2_WRITER` | writer identity for booked entries | `v2-front-door` (borrow side: `v2-borrow`) |
+| `V2_ANCHORS` | chain-head anchor file path (append-only, what `verify --against` compares) | `anchors.jsonl` in the ledger dir |
 | `V3_SCRIPTS_DIR` | where the self-check looks for standard parts | `%LOCALAPPDATA%\hermes\scripts` |
 | `HERMES_CONFIG` | host config path (wiring probe, missing = SKIP) | `%LOCALAPPDATA%\hermes\config.yaml` |
 | `V2_JOURNAL` / `V3_PUBLIC_LEDGER` / `V3_ITER_LEDGER` | explicit paths for the three ledgers, missing = SKIP | public/iteration near `data/`; verdict journal in `V2_STATE_DIR` |
@@ -181,6 +211,8 @@ ci/run_ci.py            local CI: compile + self-tests + sandbox smoke + de-biz 
 - **Optional coupling**: `ledger.py`'s `addr()` and `LedgerGanglion` need an external reflection standard part (separate repo); the core ledger works without it — record and borrow just fine.
 - **No network by default**: the spoke-aloud piece only calls a model when endpoint and key are explicitly configured; keys read from environment variables only — never stored, never echoed.
 - **Three ledgers**: verdict journal `journal.jsonl`, snapshot `ledger.json`, expired archive `expired.jsonl`, all under `V2_STATE_DIR`.
+- **Chain-head anchoring (since v3.1)**: `anchor` appends the chain head (count + sha256 digest + time) to a **local anchor file** `anchors.jsonl` (same dir by default; `V2_ANCHORS` moves it somewhere separate, which is the useful setup), and `verify --against` compares the local head against recorded anchors to catch a **truncated tail**.
+  **Honest boundary**: external third-party timestamp anchoring (publishing the chain head off-box / to a third party) **is not done** — that is the layer you need when the account is used as evidence; journal + chain + anchor rewritten together on one disk is still outside what this defends.
 
 ## Acknowledgement
 
@@ -189,4 +221,5 @@ It needs no advertising: this repository is its benchmark.
 
 ## Release
 
+Current release tag: **v3.1** (version lives in `V2/v2_gate.py` `__version__`; both READMEs and docs stay in sync).
 Before any public push, walk the four-gate checklist and announcement template in `docs/RELEASE.md`; if the checklist isn't fully ticked, nothing ships.

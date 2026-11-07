@@ -56,7 +56,7 @@ def tmp_home():
 
 def py_files():
     out = []
-    for sub in ("V2", "V3"):
+    for sub in ("V2", "V3", "tests"):
         for dirpath, dirs, files in os.walk(os.path.join(ROOT, sub)):
             dirs[:] = [d for d in dirs if d != "__pycache__"]
             out += [os.path.join(dirpath, f) for f in files if f.endswith(".py")]
@@ -140,6 +140,19 @@ def step_selfcheck():
     if rc != 0 or "HAS FAIL" in out:
         raise RuntimeError(out[-1000:])
     return out.strip().splitlines()[-1][:60]
+
+
+def step_unit_tests():
+    """验收用例（unittest，纯标准库）：V2 链头锚定 + 账本两件迭代项。
+
+    -B 不写 pyc（编译产物的相对路径由上面的 py_compile 步保证），
+    账全落在临时目录，既有账一个字节不碰。
+    """
+    rc, out = sh([PY, "-B", "-m", "unittest", "discover", "-s", "tests"], timeout=600)
+    if rc != 0 or not any(l.strip() == "OK" for l in out.splitlines()):
+        raise RuntimeError(out[-1500:])
+    ran = [l for l in out.splitlines() if l.startswith("Ran ")]
+    return (ran[-1] if ran else "OK")
 
 
 def _src_doc_lines(fp):
@@ -244,6 +257,7 @@ for _name, _fn in [
     ("ganglion_speak selftest", step_speak_selftest),
     ("sandbox smoke (record+borrow)", step_sandbox_smoke),
     ("v3_selfcheck", step_selfcheck),
+    ("unit tests (tests/)", step_unit_tests),
     ("debiz scan", step_debiz),
 ]:
     step(_name, _fn)

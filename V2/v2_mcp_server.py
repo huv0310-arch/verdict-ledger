@@ -34,7 +34,7 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 SERVER_NAME = "v2"                                # 宿主工具名前缀: mcp_v2_v2_record / mcp_v2_v2_borrow
-SERVER_VERSION = "2.0"                            # 与 v2_gate.__version__ 同步
+SERVER_VERSION = "3.1"                            # 与 v2_gate.__version__ 同步
 DEFAULT_PROTOCOL = "2025-11-25"                   # 客户端报了不认识的版本时的兜底（握手集最新）
 HANDSHAKE_PROTOCOLS = ("2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25")
 

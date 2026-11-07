@@ -518,7 +518,65 @@ class Ledger:
                 Ledger._drop_lock(wlock)
 
     @staticmethod
+    def _heal_torn_tail(path):
+        """把上一个写者**死在半路**留下的半行残尾截掉（拿锁之后、追加之前调进来）。
+
+        为什么非在写这一侧治不可（崩溃注入实测出来的根因）：读的人只在换行处切
+        （`_absorb` 的 `rfind`），残尾本身是惰的、进不了账 —— 但下一次追加是
+        `open(path, "a")`，整行会**粘在残尾后面**，切出来的是「半行 + 新行」的杂交，
+        `json.loads` 当场失败：坏一行、丢一行 —— 那一节从此世界上发生过、账上没发生
+        （实测：崩在 write 中间之后再 append，`bad_lines` 当场 +1，新写的那节整节没进链）。
+
+        口径：
+          · 正常尾巴只花一次 1 字节的读，没病不花钱；
+          · 真出事了才从后往前找最后一个换行，把残尾截到那儿（整份都没换行 =
+            全截掉 —— 那是第一节就崩了，没有任何一行是完整的）；
+          · 截不动就重试，重试不动**如实抛**，不许带着残尾往下写（写了就是坏一行丢一行）；
+          · 位置语义不受影响：`_journal_upto` 永远停在某个换行上，残尾在它后面，
+            截掉它谁都不丢已读的位置；真有人的偏移比截后的文件还大，
+            `_absorb` 本来就会「缩水 = 换代，从头重读」，重演是幂等的。
+
+        必须在锁里调：截断与追加之间不许插进第二个人（`_write_line` 持 tlock +
+        `.lock` 调进来，压实的截空也共用同一把锁）。
+        """
+        try:
+            fd = os.open(path, os.O_RDONLY)
+        except OSError:
+            return False                     # 这份流水还不存在：没有尾巴可治
+        try:
+            size = os.fstat(fd).st_size
+            if size == 0:
+                return False
+            os.lseek(fd, -1, os.SEEK_END)
+            if os.read(fd, 1) == b"\n":
+                return False                 # 正常尾巴：走人（这就是常规写路的全部开销）
+            cut, pos, tail = 0, size, b""
+            while pos > 0:                   # 从后往前找最后一个换行（只在出事时读整段）
+                n = min(65536, pos)
+                pos -= n
+                os.lseek(fd, pos, os.SEEK_SET)
+                tail = os.read(fd, n) + tail
+                i = tail.rfind(b"\n")
+                if i >= 0:
+                    cut = pos + i + 1
+                    break
+        finally:
+            os.close(fd)
+        for _ in range(40):                  # 截断要跟别人错开（Windows 上有人正开着读）
+            try:
+                with open(path, "r+b") as f:
+                    f.truncate(cut)
+                    f.flush()
+                    os.fsync(f.fileno())
+                return True
+            except OSError:
+                time.sleep(0.02)
+        raise OSError(f"半行残尾截不掉（重试 40 次仍未落稳）：{path}")
+
+    @staticmethod
     def _write_line_unlocked(path, data, blob):
+        # 先治上一个写者留下的半行残尾，再追加（详见 _heal_torn_tail 的说明）。
+        Ledger._heal_torn_tail(path)
         for i in range(40):
             try:
                 with open(path, "a", encoding="utf-8", newline="\n") as f:
@@ -610,6 +668,37 @@ class Ledger:
     def by_time(self, key):
         n = self._last_real(self.nodes.get(key))
         return (n["ts"], n["last_hit"]) if n else None
+
+    def recent(self, n):
+        """最近 N 节 —— **整本账**的时间线（跨地址），只读、不改链、不落一个字节。
+
+        三件口径（说不清就不开这个口）：
+
+        ① 查什么 —— 所有地址上的每一节，节点自带 `key`，穿成一条时间线。
+        ② 按什么排 —— 按**节自带的钟** `ts` 降序：链序只在单地址里有意义，
+           跨地址没有共同的链序（两个地址各转各的圈，圈号 1 不比圈号 3 旧）。
+           同一个 `ts` 按圈号降序、再按地址升序 —— 次序是确定的，不看字典的迭代顺序。
+        ③ 边界给谁 —— **墓碑不算**（「忘」那一档判决栏已空，它不在时间线上）；
+           **褪色节算**（`prune` 褪成梗概的那档判决和圈号还留着，它还在这本账上）；
+           n 从最新往回数 n 节，不够就全给；`n <= 0` 给 `[]`；没有钟的节排不了，
+           照 `sweep_ttl` 的规矩跳过（别拿 0 当钟）。
+
+        面还是六个 —— 这不是第七个面，是把六个面按时间穿起来换个姿势看。
+        """
+        if type(n) is not int:
+            raise ValueError(f"recent(n) 要一个整数节，收到 {n!r} —— 要几节就报几节。")
+        if n <= 0:
+            return []
+        out = []
+        for chain in self.nodes.values():
+            for node in chain or ():
+                if self.is_tombstone(node):
+                    continue                    # ③ 忘了的不在时间线上
+                if not isinstance(node.get("ts"), (int, float)):
+                    continue                    # 没钟的排不了位（同 sweep_ttl：别拿 0 当钟）
+                out.append(node)
+        out.sort(key=lambda m: (-m["ts"], -(m.get("round") or 0), m.get("key") or ""))
+        return out[:n]
 
     def by_pair(self, key, ctx_fp):
         """⑥ 配得上才叫可借
