@@ -17,6 +17,8 @@ GATE = os.path.join(ROOT, "V2", "v2_gate.py")
 _STATE = tempfile.mkdtemp(prefix="v31_anchor_")
 os.environ["V2_STATE_DIR"] = _STATE
 os.environ.pop("V2_ANCHORS", None)
+# 签名链头（v3.2）要密钥：只在本次运行的进程里生成一把临时测试钥，仓里不放任何真密钥
+os.environ.setdefault("V2_ANCHOR_KEY", __import__("secrets").token_hex(16))
 sys.path.insert(0, os.path.join(ROOT, "V2"))
 import v2_gate as G  # noqa: E402
 
@@ -77,10 +79,18 @@ class AnchorCase(unittest.TestCase):
         self.fill(3)
         a = G.anchor()
         self.assertTrue(a["ok"], a)
-        self.assertEqual(a["count"], 3)
+        self.assertEqual(a["entry_count"], 3)
         rows = [json.loads(x) for x in _read(self.anchors).splitlines() if x.strip()]
         self.assertEqual(len(rows), 1)
-        self.assertEqual(set(rows[0]), {"ts", "count", "head", "algo"})
+        self.assertEqual(set(rows[0]), {"v", "algo", "entry_count", "root_hash",
+                                        "issued_at", "key_id", "sig"})
+        key, kid, all_keys, kerr = G._load_keys()
+        self.assertTrue(kerr == "" and key, kerr)
+        n = G._anchor_norm(rows[0])
+        self.assertEqual(n["entry_count"], 3)
+        self.assertIsNotNone(n["sig"], "新格式锚行必须带签名")
+        self.assertTrue(G._sig_ok(G._anchor_payload(n), rows[0]["sig"], all_keys),
+                        "签名链头必须核得过")
         v = G.verify_against()
         self.assertTrue(v["ok"], v)
         self.fill(4)                       # 账在锚之后继续长

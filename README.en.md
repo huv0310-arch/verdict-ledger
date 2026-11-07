@@ -42,7 +42,7 @@ This repository turns those requirements into **running software**: judgments ha
 
 - **Judged right** — every judgment is one record: value (allow / block / unknown), verdict kind, situation fingerprint, timestamp; **append-only**. Think bank ledgers: errors are corrected by a red-ink reversal, the original voucher never disappears.
 - **Wrong judgments can be reversed** — a reversal is an append: the new verdict stamps over the old one, history is never deleted, **who reversed it and why stay on the record** — "what was corrected" is itself audit evidence.
-- **Nothing was tampered with** — the journal rides with a hash-chain shadow file, so edited, truncated, or deleted lines are caught by full recomputation; **since v3.1 the chain head can be anchored**: snapshot the current chain head (line count + sha256 digest) into a separate append-only anchor file, and verification compares the local chain head against it — so a tail cut from **journal and chain together** is still caught. Honest boundary: this defends against unilateral tampering, not collusion that rewrites journal and chain together.
+- **Nothing was tampered with** — the journal rides with a hash-chain shadow file, so edited, truncated, or deleted lines are caught by full recomputation; **since v3.1 the chain head can be anchored**: snapshot the current chain head (line count + sha256 digest) into a separate append-only anchor file, and verification compares the local chain head against it — so a tail cut from **journal and chain together** is still caught. Honest boundary: this defends against unilateral tampering, not collusion that rewrites journal and chain together. **Since v3.2 the anchor is a signed chain head**: count, root hash, issue time and key fingerprint are signed together, each anchor must extend the previous one, and two different roots under the same count are a fork receipt reported on the spot.
 
 ### Chain-head anchoring (new in v3.1)
 
@@ -57,6 +57,45 @@ python V2/v2_gate.py verify --against anchors.jsonl # compare local head with th
 - The anchor file lives in the ledger dir by default; `V2_ANCHORS` moves it elsewhere — **kept separately, it actually counts**;
 - `anchor` writes only the anchor file, journal and shadow chain stay byte-identical; a missing or empty anchor file makes verification go red — **never fakes a pass**;
 - An anchor pins up to its own line: rows after it are covered by a newer anchor and by the shadow chain.
+
+### Signed chain head + consistency check + equivocation (new in v3.2)
+
+The anchor upgrades from "one record" to a **signed chain head**: `entry_count`, `root_hash`, `issued_at`, `key_id` — **signed**, then appended to `anchors.jsonl`.
+
+```bash
+python V2/v2_gate.py anchor                    # append a signed chain head (configure a key first, see below)
+python V2/v2_gate.py check-anchors             # consistency check + equivocation self-check (red, exit 1)
+python V2/v2_gate.py verify --against anchors.jsonl   # verification runs both checks first, then compares heads
+```
+
+- **Old-format anchor rows keep working**: a v3.1 row (`{ts,count,head,algo}`) has no signature field, so it is read **as unsigned** — old rows are never rewritten;
+- **Consistency check**: a new anchor must be an append-only extension of the previous one — the count only moves forward (regression goes red), the root must move with the count (a frozen root goes red), and every anchor's `root_hash` is recomputed from the local journal (mismatch goes red);
+- **Equivocation self-check**: if the anchor file holds **two signed heads with the same `entry_count` and different `root_hash`**, that is an equivocation receipt — **reported loudly, never silently**, with both heads listed verbatim so an auditor can recompute them (re-anchoring the identical head twice is not a fork);
+- **Signature scheme**: HMAC-SHA256, stdlib only, no new dependency — the standard library ships no ed25519, and adding a third-party dependency just to sign would break zero-dependency. **Stated honestly**: a symmetric signature means whoever holds the key can also sign, so the key must sit with a verifier outside the writer; asymmetric signatures are the upgrade path and are not in this release;
+- **Keys are read from the environment or a file only — no real key is hard-coded in the repo**: `V2_ANCHOR_KEY` (the key itself) or `V2_ANCHOR_KEY_FILE` (a file holding only the key). Missing key → `anchor` / `challenge` refuse with a clear message; verification that finds signed rows but no key → red, never silently green;
+- **Rotation**: after rotating, put the old key in `V2_ANCHOR_KEYS` (comma-separated) and historical anchors and tickets still verify; the `key_id` changes, so an auditor can see the rotation happened.
+
+### Consistency-proof challenge ticket (new in v3.2): deadline and the precondition for failing
+
+Two heads with different counts are only evidence if the log **cannot produce a consistency proof between them**. To make "cannot produce" itself auditable, there has to be a written ticket:
+
+```bash
+python V2/v2_gate.py challenge 120 150          # issue: show consistency_proof(120,150) before the deadline
+python V2/v2_gate.py challenge-deliver ch-…     # delivery receipt (signed)
+python V2/v2_gate.py challenge-respond ch-…     # the log answers, carrying the proof
+python V2/v2_gate.py challenge-status ch-…      # query (no id = list them all)
+```
+
+Tickets live in `challenges.jsonl` (append-only, one event per line; events sharing a `request_id` fold into one ticket):
+`{request_id, from_count, to_count, issued_at, deadline, request_body, signature, delivered_at, response, responded_at | timeout}`.
+
+**Question one: how long is the deadline?** **300 seconds** by default, overridden by `V2_PROOF_DEADLINE`. Why this number: this is a **local ledger** with no network round trip — recomputing a few thousand rows locally is sub-second, so 300 seconds comfortably covers process start, lock contention and a few retries, while still denying a stalling log the power to stall the audit forever. It is not a network-grade timeout (external witness windows run hours or days); raise `V2_PROOF_DEADLINE` when real cross-machine witnessing arrives. An invalid value is never silently reinterpreted — it errors out.
+
+**Question two: what must the verifier retain before declaring "refused proof"?** Two things, both required, **enforced in code**:
+1. the **signed request ticket** (`request_body` + `signature` + `key_id`);
+2. the **delivery receipt** (`delivered_at`, signed as well).
+
+`challenge-status` semantics: no receipt → `undelivered`, **never judged a failure** (exit code 0); receipt present + past `issued_at + deadline` + no response → `timeout` = refused proof (exit code 1), and **the ticket itself is the receipt**; answered → `answered` (proof recomputed on the spot); answered after the deadline → `answered_late` (recorded, not the same as refusing). If any of the three signatures fails to verify → red, never silent.
 
 ### Timeline: the last N nodes (new in v3.1)
 
@@ -165,7 +204,7 @@ After the run, `V2_STATE_DIR` holds `journal.jsonl` (journal) and `ledger.json` 
 
 ```
 V2/                     judgment account
-  v2_gate.py            verdict gate: book, reverse, chain-verify, chain-head anchoring (chain-head / anchor / verify --against); ledger dir via V2_STATE_DIR
+  v2_gate.py            verdict gate: book, reverse, chain-verify, chain-head anchoring & signed heads (chain-head / anchor / verify --against / check-anchors), consistency-proof challenge tickets (challenge / challenge-status); ledger dir via V2_STATE_DIR
   v2_gate/ledger.py     ledger body: append, borrow, lock, compact, age-out, archive, timeline recent(n)
   v2_borrow.py          read-only borrow: list / quick-scan / single read, never mutates verdicts
   v2_mcp_server.py      MCP tool table (record / borrow), self-test via --selftest
@@ -186,7 +225,7 @@ docs/                   release SOP & reference stubs
 payout_address_proof.txt   payout address attestation: address, repo, public fingerprint, 3-step verification
 .github/workflows/      CI (runs locally first; not pushed = not public)
 ci/run_ci.py            local CI: compile + self-tests + sandbox smoke + acceptance tests + de-biz scan
-tests/                  acceptance tests (unittest, stdlib only): chain-head anchoring / recent(n) timeline / torn-tail healing
+tests/                  acceptance tests (unittest, stdlib only): chain-head anchoring / signed heads & challenge tickets / recent(n) timeline / torn-tail healing
 ```
 
 ## Environment variables
@@ -196,6 +235,11 @@ tests/                  acceptance tests (unittest, stdlib only): chain-head anc
 | `V2_STATE_DIR` | V2 ledger dir (journal / snapshot / archive / lock) | `%USERPROFILE%\.hermes\state\v2` |
 | `V2_WRITER` | writer identity for booked entries | `v2-front-door` (borrow side: `v2-borrow`) |
 | `V2_ANCHORS` | chain-head anchor file path (append-only, what `verify --against` compares) | `anchors.jsonl` in the ledger dir |
+| `V2_ANCHOR_KEY` | signing key string (anchors, challenge tickets, receipts; alternative to `V2_ANCHOR_KEY_FILE`) | no default — you must set one |
+| `V2_ANCHOR_KEY_FILE` | path to a file holding only the signing key | none |
+| `V2_ANCHOR_KEYS` | old keys kept after rotation (comma-separated), used only to verify historical records | none |
+| `V2_CHALLENGES` | consistency-proof challenge ticket file path (append-only) | `challenges.jsonl` in the ledger dir |
+| `V2_PROOF_DEADLINE` | consistency-proof deadline in seconds; an invalid value is an error | `300` |
 | `V3_SCRIPTS_DIR` | where the self-check looks for standard parts | `%LOCALAPPDATA%\hermes\scripts` |
 | `HERMES_CONFIG` | host config path (wiring probe, missing = SKIP) | `%LOCALAPPDATA%\hermes\config.yaml` |
 | `V2_JOURNAL` / `V3_PUBLIC_LEDGER` / `V3_ITER_LEDGER` | explicit paths for the three ledgers, missing = SKIP | public/iteration near `data/`; verdict journal in `V2_STATE_DIR` |
@@ -213,6 +257,7 @@ tests/                  acceptance tests (unittest, stdlib only): chain-head anc
 - **Three ledgers**: verdict journal `journal.jsonl`, snapshot `ledger.json`, expired archive `expired.jsonl`, all under `V2_STATE_DIR`.
 - **Chain-head anchoring (since v3.1)**: `anchor` appends the chain head (count + sha256 digest + time) to a **local anchor file** `anchors.jsonl` (same dir by default; `V2_ANCHORS` moves it somewhere separate, which is the useful setup), and `verify --against` compares the local head against recorded anchors to catch a **truncated tail**.
   **Honest boundary**: external third-party timestamp anchoring (publishing the chain head off-box / to a third party) **is not done** — that is the layer you need when the account is used as evidence; journal + chain + anchor rewritten together on one disk is still outside what this defends.
+- **Signed heads & challenge tickets (since v3.2)**: anchors and tickets are signed with HMAC-SHA256 and keys are read from environment variables or a file only; **the ceiling of a symmetric signature is "whoever holds the key can sign"**, so the key has to live outside the writer — stated honestly as a boundary. Collusion that rewrites journal + chain + anchors + tickets together on one disk, external third-party timestamps, witness gossip (needs external parties), and a Merkle consistency proof verifiable without the journal rows — **none of those are done**.
 
 ## Acknowledgement
 
@@ -221,5 +266,5 @@ It needs no advertising: this repository is its benchmark.
 
 ## Release
 
-Current release tag: **v3.1** (version lives in `V2/v2_gate.py` `__version__`; both READMEs and docs stay in sync).
+Current release tag: **v3.2** (version lives in `V2/v2_gate.py` `__version__`; both READMEs and docs stay in sync).
 Before any public push, walk the four-gate checklist and announcement template in `docs/RELEASE.md`; if the checklist isn't fully ticked, nothing ships.

@@ -42,7 +42,7 @@ Agent 每一步行动（放行/拦截/调用工具）今天仍然是黑箱：出
 
 - **判对过** —— 每次判断落一笔：值（放行/拦截/不知道）、判决种类、情形指纹、时刻；**只增不改**。金融里的银行凭证一个道理：错了走红冲，原凭证永远在。
 - **判错了能翻** —— 翻案走追加：新判决盖在旧判决上，历史一行不删，**谁翻的、为什么翻都留在账上**——「改过」本身也是审计要的证据。
-- **没改过** —— 流水带哈希链影子文件，事后改行、截断、删行能被全量重算抓出来；**v3.1 起链头能锚**：把某一刻的链头（条数 + sha256 摘要）追加写进独立锚文件，核验时拿本地链头对锚 —— 流水和链**一起**被截尾也对得上账。边界照实说：只防单侧篡改，流水与链同时改的共谋防不住。
+- **没改过** —— 流水带哈希链影子文件，事后改行、截断、删行能被全量重算抓出来；**v3.1 起链头能锚**：把某一刻的链头（条数 + sha256 摘要）追加写进独立锚文件，核验时拿本地链头对锚 —— 流水和链**一起**被截尾也对得上账。边界照实说：只防单侧篡改，流水与链同时改的共谋防不住。**v3.2 起锚是签名链头**：条数、根哈希、签发时刻、密钥指纹一起签名，新锚必须是旧锚的延伸，同条数撞见两个不同根即为分叉收据、当场报警。
 
 ### 链头锚定（v3.1 新增）
 
@@ -57,6 +57,45 @@ python V2/v2_gate.py verify --against anchors.jsonl # 拿本地链头对锚：�
 - 锚文件默认在账目录下，`V2_ANCHORS` 可把它挪到别处 —— **独立保存才顶用**；
 - `anchor` 只写锚文件，流水与影子链一个字节不改；锚文件不存在或为空 → 核验报红，**绝不冒充通过**；
 - 锚只钉到锚那一条：锚之后的行，靠更新的锚与影子链管。
+
+### 签名链头 + 一致性检查 + equivocation（v3.2 新增）
+
+锚从「一行记录」升级成**签名链头**：`entry_count`（条数）、`root_hash`（链上根哈希）、`issued_at`（签发时刻）、`key_id`（密钥指纹）四个字段**加签名**，再追加进 `anchors.jsonl`。
+
+```bash
+python V2/v2_gate.py anchor                    # 追加一枚签名链头（先配密钥，见下）
+python V2/v2_gate.py check-anchors             # 一致性检查 + equivocation 自检（报警退出码 1）
+python V2/v2_gate.py verify --against anchors.jsonl   # 对账同样先过这两道，再比链头
+```
+
+- **老格式锚行照旧可读**：v3.1 的 `{ts,count,head,algo}` 没有签名字段，按**无签名**继续读，旧行一个字节不改；
+- **一致性检查**：新锚必须是旧锚的 append-only 延伸 —— 条数只许往前长（倒退报红）、条数变了根必须跟着变（跳跃报红）、每枚锚的 `root_hash` 都拿本地流水重算一遍（对不上报红）；
+- **equivocation 自检**：读锚文件时撞见**同 `entry_count`、不同 `root_hash` 的两个签名头**，判定为作弊收据 —— **明确报警、不静默**，两个头按文件原样列出来供审计者复算（同条数同根的重复锚不算分叉）；
+- **签名方案**：HMAC-SHA256，纯标准库、不引依赖 —— 标准库没有 ed25519，为签名加第三方依赖违背零依赖。**代价照实说**：对称签名意味着持钥方也能签，钥必须握在写者之外的核验方手里才顶用；非对称签名是升级路径，本版没做；
+- **密钥只从环境变量或文件读，仓里不硬编码任何真密钥**：`V2_ANCHOR_KEY`（直接给密钥）或 `V2_ANCHOR_KEY_FILE`（指向只放密钥的文件）。缺钥 → `anchor` / `challenge` 拒发并说清怎么配；核验时有签名行却没钥 → 报红，绝不静默放过；
+- **轮换**：换新钥后把旧钥放进 `V2_ANCHOR_KEYS`（逗号分隔），历史锚与历史单据照常核得过；`key_id` 变了，审计者一眼看出换过钥。
+
+### 一致性证明挑战单（v3.2 新增）：deadline 与判失败的前置条件
+
+不同条数的两个链头，证据 = 两个签名头 + 日志**拿不出它们之间的一致性证明**。要让「拿不出」本身可审计，就得有书面单据：
+
+```bash
+python V2/v2_gate.py challenge 120 150          # 发单：要在 deadline 内出示 consistency_proof(120,150)
+python V2/v2_gate.py challenge-deliver ch-…     # 送达回执（签名）
+python V2/v2_gate.py challenge-respond ch-…     # 日志方答复：附一致性证明
+python V2/v2_gate.py challenge-status ch-…      # 查单（不带单号 = 全部列出）
+```
+
+单据落在 `challenges.jsonl`（append-only，一行一事件，同 `request_id` 折叠成一张单）：
+`{request_id, from_count, to_count, issued_at, deadline, request_body, signature, delivered_at, response, responded_at | timeout}`。
+
+**第一问：deadline 定多久？** 默认 **300 秒**，`V2_PROOF_DEADLINE` 覆盖。为什么是这个数：这是**本地账本**，没有网络往返 —— 核验方重算几千行是亚秒级，300 秒足够进程启动、拿锁、重试几轮，又不让一个拖着不答的账把审计无限拖住。它不是网络级超时（外部见证窗口是小时、天级），真要联网互看时把 `V2_PROOF_DEADLINE` 调大即可；非法值不静默改数，直接报错。
+
+**第二问：判「拒绝证明」之前留存什么？** 两样，缺一不可，**代码里就这么写**：
+1. **签名请求单**（`request_body` + `signature` + `key_id`）；
+2. **送达回执**（`delivered_at`，同样签名）。
+
+`challenge-status` 的状态口径：缺回执 → `undelivered`，**不判失败**（退出码 0）；有回执 + 过了 `issued_at + deadline` + 没答复 → `timeout` = 拒绝证明（退出码 1），**这张单据本身就是收据**；已答复 → `answered`（证明当场复算），过了期限才答复 → `answered_late`（留痕，不等于拒绝）。请求单、回执、答复的签名任一核不过 → 报红，不静默。
 
 ### 时间线：最近 N 节（v3.1 新增）
 
@@ -165,7 +204,7 @@ print(B.borrow(key, msg="今天天气怎么样"))                        # 借�
 
 ```
 V2/                     账本件
-  v2_gate.py            记账闸：入账、翻案、哈希链校验、链头锚定（chain-head / anchor / verify --against）；账目录走 V2_STATE_DIR
+  v2_gate.py            记账闸：入账、翻案、哈希链校验、链头锚定与签名链头（chain-head / anchor / verify --against / check-anchors）、一致性证明挑战单（challenge / challenge-status）；账目录走 V2_STATE_DIR
   v2_gate/ledger.py     账本本体：追加、借票、锁、压实、按钟忘、归档、时间线 recent(n)
   v2_borrow.py          只读借账：翻目录 / 快扫 / 单笔借回，不改判决
   v2_mcp_server.py      MCP 工具表（record / borrow），自检在 --selftest
@@ -186,7 +225,7 @@ docs/                   发布 SOP 与引用位
 payout_address_proof.txt   收款地址归属证明：地址、仓库、公开指纹与三步核验
 .github/workflows/      CI（先本地跑，不推远端不算对外）
 ci/run_ci.py            本地 CI：编译 + 自测 + 沙箱冒烟 + 验收用例 + 去业务扫描
-tests/                  验收用例（unittest，纯标准库）：链头锚定 / 时间线 recent(n) / 半行残尾自愈
+tests/                  验收用例（unittest，纯标准库）：链头锚定 / 签名链头与挑战单 / 时间线 recent(n) / 半行残尾自愈
 ```
 
 ## 环境变量
@@ -196,6 +235,11 @@ tests/                  验收用例（unittest，纯标准库）：链头锚定
 | `V2_STATE_DIR` | V2 账目录（流水 / 快照 / 归档 / 锁） | `%USERPROFILE%\.hermes\state\v2` |
 | `V2_WRITER` | 入账写者标识 | `v2-front-door`（借账件默认 `v2-borrow`） |
 | `V2_ANCHORS` | 链头锚文件路径（append-only，`verify --against` 比对它） | 账目录下的 `anchors.jsonl` |
+| `V2_ANCHOR_KEY` | 签名密钥字符串（签锚、签挑战单与回执；与 `V2_ANCHOR_KEY_FILE` 二选一） | 没有默认值，必须自己配 |
+| `V2_ANCHOR_KEY_FILE` | 放签名密钥的文件路径（文件里只有密钥本身） | 无 |
+| `V2_ANCHOR_KEYS` | 轮换留下的旧密钥（逗号分隔），只用来核验历史单据 | 无 |
+| `V2_CHALLENGES` | 一致性证明挑战单文件路径（append-only） | 账目录下的 `challenges.jsonl` |
+| `V2_PROOF_DEADLINE` | 一致性证明的 deadline（秒），非法值直接报错 | `300` |
 | `V3_SCRIPTS_DIR` | 体检脚本去哪找标准件 | `%LOCALAPPDATA%\hermes\scripts` |
 | `HERMES_CONFIG` | 宿主配置路径（查接线，缺场记 SKIP） | `%LOCALAPPDATA%\hermes\config.yaml` |
 | `V2_JOURNAL` / `V3_PUBLIC_LEDGER` / `V3_ITER_LEDGER` | 三本账各自路径，缺场记 SKIP | 公共/迭代账就近 `data/`；判决流水在 `V2_STATE_DIR` |
@@ -214,6 +258,7 @@ tests/                  验收用例（unittest，纯标准库）：链头锚定
 - **三本账**：判决流水 `journal.jsonl`、快照 `ledger.json`、过期归档 `expired.jsonl`，全在 `V2_STATE_DIR` 下。
 - **链头锚定（v3.1 起）**：`anchor` 把链头（条数 + sha256 摘要 + 时刻）追加写进**本地锚文件** `anchors.jsonl`（默认与账同目录，`V2_ANCHORS` 挪到独立位置更顶用），`verify --against` 拿本地链头对历史锚，抓得出**尾部被截断**。
   **边界照实说**：外部第三方时间戳锚定（把链头发到链外 / 第三方）**还没做** —— 账被当证据用的时候才需要那一层；同盘的流水 + 链 + 锚一起改写的共谋，也仍在边界之外。
+- **签名链头与挑战单（v3.2 起）**：锚与挑战单用 HMAC-SHA256 签名，密钥只从环境变量 / 文件读；**对称签名的强度上限是「持钥方就能签」**，所以钥要放在写者之外的核验方手里，这一层的边界照实说。同盘的流水 + 链 + 锚 + 挑战单一起改写的共谋、外部第三方时间戳、见证者互看（gossip，要外部方）、不给行也能验的 Merkle 一致性证明 —— **都还没做**。
 
 ## 致谢
 
@@ -222,5 +267,5 @@ tests/                  验收用例（unittest，纯标准库）：链头锚定
 
 ## 发布
 
-当前发布 tag：**v3.1**（版本号见 `V2/v2_gate.py` 的 `__version__`，中英 README 与 docs 同步）。
+当前发布 tag：**v3.2**（版本号见 `V2/v2_gate.py` 的 `__version__`，中英 README 与 docs 同步）。
 对外推送前先走 `docs/RELEASE.md` 的四门槛核对清单与公告模板；清单没全勾，一条都不发。

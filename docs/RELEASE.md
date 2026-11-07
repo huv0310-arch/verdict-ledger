@@ -3,6 +3,7 @@
 > **发布冻结 2026-11-06 17:00，发布窗口 2026-11-07 04:15 北京＝美东周五 15:15（实际发车；原暂定 02:00 顺延，发布人当日定稿）** —— 从此刻起本目录只修 bug、不加功能。
 > 旁注：窗口已定稿（见上行）；备选 11-08 未启用。
 > 旁注 2（2026-11-07）：**v3.1 发布已获发布人明确指示，冻结解除** —— 本次只加「链头锚定」与两件已带验收用例的成熟迭代项（时间线 recent(n)、半行残尾自愈），其余本地迭代继续留着不发。
+> 旁注 3（2026-11-07）：**v3.2 发布指示** —— 收下外部审计当场戳中的四条：签名链头（entry_count / root_hash / issued_at / key_id + 签名）、新锚必须是旧锚的 append-only 延伸、同条数异根的 equivocation 报警、一致性证明挑战单（签名请求单 + 送达回执 + 书面 deadline）；witness / gossip 挂账不施工。
 
 本文件是**唯一**的对外动作闸门。清单没全勾：不 push、不发公告、不发任何对外消息。
 （发布准备阶段允许的 git 动作只有本机 `git add` / `git commit`，且只在私仓区。）
@@ -36,12 +37,13 @@ python V2/v2_mcp_server.py --selftest                 # 临时账端到端
 - [x] 2026-11-06 复检：docs/ 仅 纪念章规格_引用位.md（正本不在）+ RECASE/ANNOUNCE/RELEASE
 - [x] 2026-11-06 复检：README+docs+V2/V3 源码 正则扫 密钥/本地路径/公司名 = 0 命中；CI debiz 扫描 0 残留
 - [x] 2026-11-07 复检（v3.1）：`python ci/run_ci.py` = ALL GREEN（8 步：编译 + 4 个自测 + 沙箱冒烟 + 体检 + 验收用例 18 条 + debiz 0 残留）；`git tag -l` 见 v3.1
+- [x] 2026-11-07 复检（v3.2）：`python ci/run_ci.py` = ALL GREEN（8 步：编译 + 4 个自测 + 沙箱冒烟 + 体检 + 验收用例 35 条（含同条数异根报警 / 缺回执不判失败 / 老格式锚行可读 / deadline 超时判定）+ debiz 0 残留）；黑话扫描按新增行 0 命中；`git tag -l` 见 v3.2
 - [ ] 纪念章：四门槛全勾 + 发布人确认后，正本按 `docs/纪念章规格.md` 落库（未确认则保持引用位，发布说明按引用写法「规格由发布人保管」）
 
 ## 三、push（四门槛全勾之后才执行）
 
 ```bash
-git add -A && git commit -m "release: v3.1"
+git add -A && git commit -m "release: v3.2"
 git remote add origin <仓库地址>          # 首次
 git push -u origin main                   # 只在这一步之后才算"对外"
 ```

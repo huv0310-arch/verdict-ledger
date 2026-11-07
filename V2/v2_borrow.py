@@ -21,7 +21,7 @@ if HERE not in sys.path:
 import v2_gate as G            # noqa: E402  拿到 _Ledger / SNAP / JOURNAL / TTL
 
 WRITER = os.environ.get("V2_WRITER", "v2-borrow")
-__version__ = "3.1"            # 标准件版本号（2026-11-07 发布，与 v2_gate.__version__ 同步）
+__version__ = "3.2"            # 标准件版本号（2026-11-07 发布，与 v2_gate.__version__ 同步）
 
 
 def load():
