@@ -270,8 +270,8 @@ examples/               对账挑战样例：链头四字段复算与比对 chai
 一条只读的链头命令，一行 JSON 出四个字段：
 
 ```bash
-python V2/v2_gate.py chain-head                                        # 现役账本：只读复算整条链
-python examples/chain_head.py --journal examples/sample_journal.jsonl  # 同一个头，按四字段名输出
+python V2/v2_gate.py chain-head                                        # 现役账本：只读复算整条链，输出 lines/head/ts
+python examples/chain_head.py --journal examples/sample_journal.jsonl  # 四字段名口径（样例流水；去掉 --journal 即现役账本）
 ```
 
 输出样例（`entry_count` 与 `root_hash` 是这条流水算出来的定值，`issued_at` 是跑的那一刻）：

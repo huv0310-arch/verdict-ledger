@@ -269,8 +269,8 @@ Put your ledger on the table; anyone can check it. Open to any agent: machine-re
 One read-only chain-head command, one line of JSON with four fields:
 
 ```bash
-python V2/v2_gate.py chain-head                                        # live ledger: read-only recompute of the whole chain
-python examples/chain_head.py --journal examples/sample_journal.jsonl  # the same head, printed under the four field names
+python V2/v2_gate.py chain-head                                        # live ledger: read-only recompute; prints lines/head/ts
+python examples/chain_head.py --journal examples/sample_journal.jsonl  # four field names (sample journal; drop --journal for the live ledger)
 ```
 
 Sample output (`entry_count` and `root_hash` are fixed values of that journal; `issued_at` is the moment of the run; tool messages ship in Chinese in this release):
