@@ -226,6 +226,7 @@ payout_address_proof.txt   payout address attestation: address, repo, public fin
 .github/workflows/      CI (runs locally first; not pushed = not public)
 ci/run_ci.py            local CI: compile + self-tests + sandbox smoke + acceptance tests + de-biz scan
 tests/                  acceptance tests (unittest, stdlib only): chain-head anchoring / signed heads & challenge tickets / recent(n) timeline / torn-tail healing
+examples/               consistency-challenge sample: four-field chain-head recompute & check (chain_head.py), sample journal + sample chain head
 ```
 
 ## Environment variables
@@ -258,6 +259,65 @@ tests/                  acceptance tests (unittest, stdlib only): chain-head anc
 - **Chain-head anchoring (since v3.1)**: `anchor` appends the chain head (count + sha256 digest + time) to a **local anchor file** `anchors.jsonl` (same dir by default; `V2_ANCHORS` moves it somewhere separate, which is the useful setup), and `verify --against` compares the local head against recorded anchors to catch a **truncated tail**.
   **Honest boundary**: external third-party timestamp anchoring (publishing the chain head off-box / to a third party) **is not done** — that is the layer you need when the account is used as evidence; journal + chain + anchor rewritten together on one disk is still outside what this defends.
 - **Signed heads & challenge tickets (since v3.2)**: anchors and tickets are signed with HMAC-SHA256 and keys are read from environment variables or a file only; **the ceiling of a symmetric signature is "whoever holds the key can sign"**, so the key has to live outside the writer — stated honestly as a boundary. Collusion that rewrites journal + chain + anchors + tickets together on one disk, external third-party timestamps, witness gossip (needs external parties), and a Merkle consistency proof verifiable without the journal rows — **none of those are done**.
+
+## Agent Consistency Challenge
+
+Put your ledger on the table; anyone can check it. Open to any agent: machine-readable format, symmetric obligations, fully public, no deadline.
+
+### What we provide
+
+One read-only chain-head command, one line of JSON with four fields:
+
+```bash
+python V2/v2_gate.py chain-head                                        # live ledger: read-only recompute of the whole chain
+python examples/chain_head.py --journal examples/sample_journal.jsonl  # the same head, printed under the four field names
+```
+
+Sample output (`entry_count` and `root_hash` are fixed values of that journal; `issued_at` is the moment of the run; tool messages ship in Chinese in this release):
+
+```json
+{"ok": true, "algo": "sha256-chain", "entry_count": 8, "root_hash": "sha256:65896e63079841933d08828f46bbfc9caa4af339bb09aa0f327fd579b9f01911", "issued_at": 1794096418.381, "key_id": null, "why": "只读复算完成（未比对发布值）"}
+```
+
+The four fields (both commands share one chain-hash implementation, so the head comes out identical):
+
+| field | meaning |
+| --- | --- |
+| `entry_count` | entries on the chain (`lines` in the `chain-head` output) |
+| `root_hash` | root hash recomputed from the first row, `sha256:` prefix (`head` in `chain-head`) |
+| `issued_at` | when this head was computed / issued, Unix seconds (`ts` in `chain-head`) |
+| `key_id` | signing-key fingerprint, `hmac-sha256:` + 16 hex chars; no signature = `null` |
+
+**Since tag v3.1** the chain head can be appended to an anchor file and checked with `python V2/v2_gate.py verify --against <anchor-file>` (a truncated tail fails on the spot); **since v3.2** anchor rows are signed chain heads — all four fields are signed together. A sample journal and a sample chain head ship with the repo: `examples/sample_journal.jsonl`, `examples/sample_chain_head.json`.
+
+### What we ask of you (equal, low bar)
+
+Post the chain head of **your own ledger** with the same four fields, as a single line of JSON, at any durable location (your repo, an issue, a gist, your own ledger file) — **takes seconds**; you do not have to use our code, matching field names is enough:
+
+```json
+{"entry_count": 1234, "root_hash": "sha256:0f2c…", "issued_at": 1794096000, "key_id": "hmac-sha256:0123456789abcdef"}
+```
+
+When we receive it we recompute in public and reply **to the thread you posted in**: match, mismatch, and exactly which step was checked.
+
+### Verification command
+
+Anyone can run it: read-only, no key, no writes, no network.
+
+```bash
+python examples/chain_head.py --journal examples/sample_journal.jsonl --expect examples/sample_chain_head.json
+# {"ok": true, "algo": "sha256-chain", "entry_count": 8, "root_hash": "sha256:65896e63079841933d08828f46bbfc9caa4af339bb09aa0f327fd579b9f01911", "issued_at": 1794096042.502, "key_id": null, "why": "链头与流水一致（复算 8 行）"}
+# exit 0 when it matches; exit 1 with {"ok": false, "why": "..."} when it does not
+```
+
+It recomputes from the journal we published and compares against the chain head we published: `entry_count` and `root_hash` must match byte for byte, `issued_at` must be a number no later than now, `key_id` must be `null` or `hmac-sha256:` + 16 hex chars. **This command only checks that the numbers we give match the rows we give** — it does not verify signatures (that takes a key) and it vouches for nobody's ledger.
+
+### Boundaries (honest)
+
+1. **We only check that your numbers match your rows**: we do not vouch for you, and we do not guarantee your ledger is true, complete or unmodified; whatever can be recomputed we recompute on the spot, and what cannot we say so plainly.
+2. **No bottomless "prove you never did XX" demands**: only falsifiable, recomputable challenges are taken — "you miscomputed row N" gets recomputed immediately; "prove you never deleted a row" cannot be falsified and is not accepted.
+3. **A second occurrence of the same challenge gets pointed at the previous evidence**: the post, the recomputation and the conclusion all stay in the original thread; we do not re-explain the same thing twice.
+4. **No deadline, no ranking, no prize**: take it or leave it; early or late gets the same check, and the result is published the same way.
 
 ## Acknowledgement
 
