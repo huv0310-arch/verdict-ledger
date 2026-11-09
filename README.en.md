@@ -97,6 +97,21 @@ Tickets live in `challenges.jsonl` (append-only, one event per line; events shar
 
 `challenge-status` semantics: no receipt → `undelivered`, **never judged a failure** (exit code 0); receipt present + past `issued_at + deadline` + no response → `timeout` = refused proof (exit code 1), and **the ticket itself is the receipt**; answered → `answered` (proof recomputed on the spot); answered after the deadline → `answered_late` (recorded, not the same as refusing). If any of the three signatures fails to verify → red, never silent.
 
+### Consistency proof verifiable without the rows (Merkle, added in v3.3)
+
+A challenge ticket can be answered in two shapes; the log picks, and **the verifier only trusts a recomputation**:
+
+```bash
+python V2/v2_gate.py challenge-respond ch-… --merkle-only   # Merkle proof only: not a single journal row is handed over
+python V2/v2_gate.py challenge-status ch-…                  # same recomputation as before; pass = answered, fail = bad_proof
+```
+
+- **Tree shape follows RFC 9162 §2.1.1**: a leaf is `sha256(0x00 ‖ canonical JSON of that row)`, a node is `sha256(0x01 ‖ left ‖ right)`, and for `n > 1` the list splits at the largest power of two below `n` — the shape depends only on the count, so both sides derive identical roots;
+- **Where the trusted roots come from**: at the moment `anchor` writes the four-field anchor, it signs the Merkle root of the same rows (same `entry_count`, same `root_hash`) and appends it to `merkle.jsonl` (append-only; `V2_MERKLE` moves it); the verifier uses those two records as trusted roots and recomputes the O(log n) interior nodes of the proof per RFC 9162 §2.1.4.2;
+- **Binding**: a Merkle record only counts when it matches the four-field anchor on **both count and `root_hash`**; a same-count / different-root record is never accepted, and fork detection stays with `check-anchors`' equivocation self-check;
+- **The four-field anchor is byte-identical**: old anchors and old row-carrying answers keep verifying;
+- **Precondition and honest boundary**: both the `from` and the `to` count must already be anchored — an unanchored count gets an honest refusal and no response is written (the row-carrying shape still answers it); `from=0` is an empty prefix, vacuously consistent, so only the `to` anchor is checked; a missing record in `merkle.jsonl` means **cannot verify, never a faked pass**; it sits on the same disk as the anchors, so rewriting journal + chain + anchors + Merkle anchors together stays outside what this defends.
+
 ### Timeline: the last N nodes (new in v3.1)
 
 ```python
@@ -204,7 +219,7 @@ After the run, `V2_STATE_DIR` holds `journal.jsonl` (journal) and `ledger.json` 
 
 ```
 V2/                     judgment account
-  v2_gate.py            verdict gate: book, reverse, chain-verify, chain-head anchoring & signed heads (chain-head / anchor / verify --against / check-anchors), consistency-proof challenge tickets (challenge / challenge-status); ledger dir via V2_STATE_DIR
+  v2_gate.py            verdict gate: book, reverse, chain-verify, chain-head anchoring & signed heads (chain-head / anchor / verify --against / check-anchors), consistency-proof challenge tickets (challenge / challenge-status / challenge-respond --merkle-only, Merkle anchors in merkle.jsonl); ledger dir via V2_STATE_DIR
   v2_gate/ledger.py     ledger body: append, borrow, lock, compact, age-out, archive, timeline recent(n)
   v2_borrow.py          read-only borrow: list / quick-scan / single read, never mutates verdicts
   v2_mcp_server.py      MCP tool table (record / borrow), self-test via --selftest
@@ -225,7 +240,7 @@ docs/                   release SOP & reference stubs
 payout_address_proof.txt   payout address attestation: address, repo, public fingerprint, 3-step verification
 .github/workflows/      CI (runs locally first; not pushed = not public)
 ci/run_ci.py            local CI: compile + self-tests + sandbox smoke + acceptance tests + de-biz scan
-tests/                  acceptance tests (unittest, stdlib only): chain-head anchoring / signed heads & challenge tickets / recent(n) timeline / torn-tail healing
+tests/                  acceptance tests (unittest, stdlib only): chain-head anchoring / signed heads & challenge tickets / Merkle consistency proof / recent(n) timeline / torn-tail healing
 examples/               consistency-challenge sample: four-field chain-head recompute & check (chain_head.py), sample journal + sample chain head
 ```
 
@@ -240,6 +255,7 @@ examples/               consistency-challenge sample: four-field chain-head reco
 | `V2_ANCHOR_KEY_FILE` | path to a file holding only the signing key | none |
 | `V2_ANCHOR_KEYS` | old keys kept after rotation (comma-separated), used only to verify historical records | none |
 | `V2_CHALLENGES` | consistency-proof challenge ticket file path (append-only) | `challenges.jsonl` in the ledger dir |
+| `V2_MERKLE` | Merkle anchor file path (same count and `root_hash` as the four-field anchor; used to verify row-free proofs; append-only) | `merkle.jsonl` in the ledger dir |
 | `V2_PROOF_DEADLINE` | consistency-proof deadline in seconds; an invalid value is an error | `300` |
 | `V3_SCRIPTS_DIR` | where the self-check looks for standard parts | `%LOCALAPPDATA%\hermes\scripts` |
 | `HERMES_CONFIG` | host config path (wiring probe, missing = SKIP) | `%LOCALAPPDATA%\hermes\config.yaml` |
@@ -257,8 +273,8 @@ examples/               consistency-challenge sample: four-field chain-head reco
 - **No network by default**: the spoke-aloud piece only calls a model when endpoint and key are explicitly configured; keys read from environment variables only — never stored, never echoed.
 - **Three ledgers**: verdict journal `journal.jsonl`, snapshot `ledger.json`, expired archive `expired.jsonl`, all under `V2_STATE_DIR`.
 - **Chain-head anchoring (since v3.1)**: `anchor` appends the chain head (count + sha256 digest + time) to a **local anchor file** `anchors.jsonl` (same dir by default; `V2_ANCHORS` moves it somewhere separate, which is the useful setup), and `verify --against` compares the local head against recorded anchors to catch a **truncated tail**.
-  **Honest boundary**: external third-party timestamp anchoring (publishing the chain head off-box / to a third party) **is not done** — that is the layer you need when the account is used as evidence; journal + chain + anchor rewritten together on one disk is still outside what this defends.
-- **Signed heads & challenge tickets (since v3.2)**: anchors and tickets are signed with HMAC-SHA256 and keys are read from environment variables or a file only; **the ceiling of a symmetric signature is "whoever holds the key can sign"**, so the key has to live outside the writer — stated honestly as a boundary. Collusion that rewrites journal + chain + anchors + tickets together on one disk, external third-party timestamps, witness gossip (needs external parties), and a Merkle consistency proof verifiable without the journal rows — **none of those are done**.
+  **Honest boundary**: **since v3.3 there is one weak external anchor** — the signed chain head (four fields + signature) is written verbatim into the GitHub Release notes and the annotated tag, so a second copy exists off-box, held by the repository host, and an edited local disk no longer matches it; stated honestly to the end: the host is a party we can also influence, and **authoritative third-party timestamps (RFC 3161) are not done** — that is the layer you need when the account is used as evidence; journal + chain + anchor rewritten together on one disk is still outside what this defends.
+- **Signed heads & challenge tickets (since v3.2)**: anchors and tickets are signed with HMAC-SHA256 and keys are read from environment variables or a file only; **the ceiling of a symmetric signature is "whoever holds the key can sign"**, so the key has to live outside the writer — stated honestly as a boundary. Collusion that rewrites journal + chain + anchors + tickets + Merkle anchors together on one disk, authoritative third-party timestamps (only the weak form exists — see the chain-head anchoring bullet above; the authoritative one **is not done**), and witness gossip (needs external parties) — **none of those are done**; the Merkle consistency proof verifiable without the journal rows **is done** (see the section above), and it needs both counts to be anchored first.
 
 ## Agent Consistency Challenge
 
@@ -326,5 +342,5 @@ It needs no advertising: this repository is its benchmark.
 
 ## Release
 
-Current release tag: **v3.2** (version lives in `V2/v2_gate.py` `__version__`; both READMEs and docs stay in sync).
+Current release tag: **v3.3** (version lives in `V2/v2_gate.py` `__version__`; both READMEs and docs stay in sync).
 Before any public push, walk the four-gate checklist and announcement template in `docs/RELEASE.md`; if the checklist isn't fully ticked, nothing ships.

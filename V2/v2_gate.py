@@ -18,7 +18,7 @@ STATE_DIR = os.environ.get("V2_STATE_DIR") or os.path.join(
 JOURNAL = os.path.join(STATE_DIR, "journal.jsonl")
 SNAP = os.path.join(STATE_DIR, "ledger.json")
 WRITER = os.environ.get("V2_WRITER", "v2-front-door")
-__version__ = "3.2"             # 对外发布 tag v3.2（2026-11-07）；沿革见 git log / CHANGELOG（对外发布时另附）
+__version__ = "3.3"             # 对外发布 tag v3.3（2026-11-09）：Merkle 一致性证明补齐；沿革见 git log / CHANGELOG（对外发布时另附）
 TTL = 3600   # 旧世代（v1）统一窗，仅历史节自带此值，本文件不再写入
 
 _Ledger = None
@@ -227,6 +227,8 @@ def verify_chain():
 # 外部第三方时间戳锚定（把链头发到链外）还没做 —— 账被当证据用的时候才需要那一层。
 ANCHORS = os.environ.get("V2_ANCHORS") or os.path.join(STATE_DIR, "anchors.jsonl")
 ALGO = "sha256-chain"
+MERKLE_ALGO = "sha256-merkle"   # Merkle 根的算法标识（RFC 9162 的树形 + sha256），与链上根分开
+MERKLE = os.environ.get("V2_MERKLE") or os.path.join(STATE_DIR, "merkle.jsonl")
 
 
 def _anchor_path(path=None):
@@ -266,13 +268,15 @@ def chain_head():
                 chain = [json.loads(x) for x in f if x.strip()]
         res = {"ok": True, "algo": ALGO, "lines": n, "chained": len(chain),
                "head": ("sha256:" + head) if head else "", "ts": round(time.time(), 3), "why": ""}
+        # Merkle 根与链上根同出一份流水（RFC 9162 树形）：给「不给行也能验」的证明当可信根
+        res["merkle_root"] = "sha256:" + merkle_root(rows)
         if head and chain and chain[-1].get("h") != head:
             res["ok"] = False
             res["why"] = "影子链最后一行与 journal 重算的链头对不上（先跑 verify 看断在哪）"
         return res
     except Exception as e:
         return {"ok": False, "algo": ALGO, "lines": -1, "chained": -1,
-                "head": "", "why": str(e)[:120]}
+                "head": "", "merkle_root": "", "why": str(e)[:120]}
 
 
 def anchor(path=None):
@@ -321,8 +325,22 @@ def anchor(path=None):
             os.makedirs(d, exist_ok=True)
         with open(ap, "a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        # 同一段流水的 Merkle 根也签一份追加进 merkle.jsonl（给「不给行也能验」的证明当可信根）。
+        # 写不进去不拖垮四字段锚 —— 如实回报，核验那一侧会报「验不了」，不冒充通过。
+        mroot, merr = h.get("merkle_root") or "", ""
+        try:
+            if not mroot:
+                merr = "链头没带 Merkle 根，Merkle 锚没写"
+            else:
+                merr = _append_merkle_anchor(h["lines"], h["head"], mroot, key, kid, issued)
+        except Exception as e:
+            merr = str(e)[:120]
         out = dict(rec)
-        out.update({"ok": True, "path": ap, "why": "签名链头已追加进锚文件"})
+        out.update({"ok": True, "path": ap,
+                    "merkle_root": (mroot if not merr else ""),
+                    "merkle_ok": not merr,
+                    "why": "签名链头已追加进锚文件" + ("；Merkle 锚同签一份" if not merr
+                                                   else "；Merkle 锚没写上：" + merr)})
         return out
     except Exception as e:
         return {"ok": False, "path": ap, "why": str(e)[:120]}
@@ -582,6 +600,267 @@ def check_anchors(path=None, recompute=True):
     return res
 
 
+# ══════════ 不给行也能验：Merkle 一致性证明（RFC 9162）══════════
+# 缺口出处：README 边界里写着「不给行也能验的 Merkle 一致性证明还没做」——这一段把它补上。
+# 做法（纯标准库，树形按 RFC 9162 §2.1.1 / 证明按 §2.1.4）：
+#   · 叶子 = 该行规范化 JSON 的 sha256(0x00 || 行)；节点 = sha256(0x01 || 左 || 右)；
+#     n>1 时 k = 小于 n 的最大 2 的幂 —— 树形只由条数决定，两边各自算必然同形。
+#   · 一致性证明 = 从 from 端的根走到 to 端的根所需的 O(log n) 个中间节点，**一个原始行都不给**；
+#     核验方按 §2.1.4.2 复算，两枚根必须与自己手里的锚一致才算过。
+#   · 可信根从哪来：anchor 在写四字段锚的同一刻，把同一条数、同一 root_hash 的 Merkle 根
+#     签名追加进 merkle.jsonl（append-only，V2_MERKLE 可挪位置）；四字段锚一个字节没改。
+#   · 绑定口径：Merkle 记录必须与四字段锚**同条数、同 root_hash** 才参与核验，
+#     同条数异根的 Merkle 记录不采信（分叉检测仍归 check-anchors 的 equivocation 自检）。
+#   · 边界照实说：from=0 是空前缀，本来就一致（只核 to 端的锚）；merkle 锚缺记录 → 报「验不了」，
+#     绝不冒充通过；它与锚同机同盘，流水 + 链 + 锚 + Merkle 锚一起改写的共谋仍在边界之外。
+
+
+def _merkle_path(path=None):
+    return path or MERKLE
+
+
+def _m_hash(data):
+    """sha256 → 小写十六进制。"""
+    import hashlib
+    return hashlib.sha256(data).hexdigest()
+
+
+def _strip_sha(s):
+    s = "" if s is None else str(s)
+    return s[7:] if s.startswith("sha256:") else s
+
+
+def _mth(leaves, lo, hi, cache):
+    """MTH(leaves[lo:hi])（RFC 9162 §2.1.1）：空表 = HASH()；单叶 = 叶哈希；
+    n>1 → HASH(0x01 || MTH(左 k) || MTH(右 n-k))，k = 小于 n 的最大 2 的幂。"""
+    n = hi - lo
+    if n <= 0:
+        return _m_hash(b"")
+    if n == 1:
+        return leaves[lo]
+    if (lo, hi) in cache:
+        return cache[(lo, hi)]
+    k = 1 << (((n - 1).bit_length()) - 1)
+    v = _m_hash(b"\x01" + bytes.fromhex(_mth(leaves, lo, lo + k, cache))
+                + bytes.fromhex(_mth(leaves, lo + k, hi, cache)))
+    cache[(lo, hi)] = v
+    return v
+
+
+def _leaves_of(rows):
+    """叶子哈希列表：每行规范化 JSON 前面挂 0x00（与节点的 0x01 分域）。"""
+    return [_m_hash(b"\x00" + _canon(r).encode("utf-8")) for r in rows]
+
+
+def merkle_root(rows):
+    """整段流水的 Merkle 根（不带前缀的十六进制）。"""
+    leaves = _leaves_of(rows)
+    return _mth(leaves, 0, len(leaves), {})
+
+
+def _subproof(leaves, m, lo, hi, complete, out, cache):
+    """RFC 9162 §2.1.4.1 的 SUBPROOF（绝对下标写法，m >= 1 才会进来）。"""
+    n, rel = hi - lo, m - lo
+    if rel == n:                       # 走到 from 端那棵完整的子树
+        if not complete:
+            out.append(_mth(leaves, lo, hi, cache))
+        return
+    k = 1 << (((n - 1).bit_length()) - 1)
+    if rel <= k:
+        _subproof(leaves, m, lo, lo + k, complete, out, cache)
+        out.append(_mth(leaves, lo + k, hi, cache))     # 右半边只在 to 端存在：给个承诺
+    else:
+        _subproof(leaves, m, lo + k, hi, False, out, cache)
+        out.append(_mth(leaves, lo, lo + k, cache))     # 左半边两边同形：给个承诺
+
+
+def merkle_consistency_proof(rows, from_count, to_count):
+    """生成一致性证明的节点列表（不含任何原始行）。返回 (nodes, 错误)。"""
+    try:
+        f_cnt, t_cnt = int(from_count), int(to_count)
+    except (TypeError, ValueError):
+        return None, "from / to 必须是整数条数"
+    if f_cnt < 1 or t_cnt <= f_cnt or t_cnt > len(rows):
+        return None, ("口径要求 0 < from < to <= 本地行数（收到 from=%s to=%s，本地 %d 行）"
+                      % (from_count, to_count, len(rows)))
+    leaves = _leaves_of(rows[:t_cnt])
+    out = []
+    _subproof(leaves, f_cnt, 0, t_cnt, True, out, {})
+    return out, ""
+
+
+def check_merkle_consistency(first, second, first_hash, second_hash, path):
+    """RFC 9162 §2.1.4.2 的核验算法，逐条照抄。返回 (ok, why)。"""
+    try:
+        first, second = int(first), int(second)
+        fh, sh = _strip_sha(first_hash), _strip_sha(second_hash)
+        if not path:
+            return False, "一致性证明是空的（RFC 9162 §2.1.4.2 第 1 步：空路径直接判失败）"
+        if first <= 0 or second <= first:
+            return False, "口径要求 0 < from < to（收到 from=%s to=%s）" % (first, second)
+        if len(fh) != 64 or len(sh) != 64:
+            return False, "两枚根不是 64 位十六进制（收到 %d / %d 位）" % (len(fh), len(sh))
+        nodes = list(path)
+        if first & (first - 1) == 0:            # from 条数是 2 的幂：先把 from 端的根补进序列
+            nodes = [fh] + nodes
+        fn, sn = first - 1, second - 1
+        while fn & 1:                           # 第 4 步：把 fn 的低位 1 右移干净
+            fn >>= 1
+            sn >>= 1
+        fr = sr = nodes[0]
+        for c in nodes[1:]:
+            if sn == 0:
+                return False, "证明没走完就到头了（sn 提前归 0）"
+            if (fn & 1) or fn == sn:
+                fr = _m_hash(b"\x01" + bytes.fromhex(c) + bytes.fromhex(fr))
+                sr = _m_hash(b"\x01" + bytes.fromhex(c) + bytes.fromhex(sr))
+                while fn and not (fn & 1):      # 第 6b(iii) 步
+                    fn >>= 1
+                    sn >>= 1
+            else:
+                sr = _m_hash(b"\x01" + bytes.fromhex(sr) + bytes.fromhex(c))
+            fn >>= 1
+            sn >>= 1
+        if fr != fh:
+            return False, "from 端的根复算对不上"
+        if sr != sh:
+            return False, "to 端的根复算对不上"
+        if sn != 0:
+            return False, "证明没走完（sn=%d）" % sn
+        return True, "Merkle 一致性证明复算通过（%d 个节点，一个原始行都没给）" % len(nodes)
+    except Exception as e:
+        return False, "Merkle 一致性证明核验出错：%s" % str(e)[:90]
+
+
+def _merkle_payload(rec):
+    """被签名的五个字段（Merkle 锚）：核验时从记录里原样重建同一份。"""
+    return {"entry_count": rec["entry_count"], "root_hash": rec["root_hash"],
+            "merkle_root": rec["merkle_root"], "issued_at": rec["issued_at"],
+            "key_id": rec["key_id"]}
+
+
+def _append_merkle_anchor(count, root_hash, mroot, key, kid, issued, path=None):
+    """Merkle 锚追加进 merkle.jsonl（append-only，签名）。返回错误文案（空 = 成功）。"""
+    mp = _merkle_path(path)
+    rec = {"v": 1, "algo": MERKLE_ALGO, "entry_count": int(count), "root_hash": root_hash,
+           "merkle_root": mroot, "issued_at": issued, "key_id": kid}
+    rec["sig"] = _hmac_sign(key, _canon(_merkle_payload(rec)))
+    d = os.path.dirname(mp)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    with open(mp, "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    return ""
+
+
+def _read_merkle_anchors(path=None):
+    """读 merkle.jsonl → (记录列表, 错误)。文件不存在 → ([], None)。"""
+    mp = _merkle_path(path)
+    if not os.path.exists(mp):
+        return [], None
+    rows, err = [], None
+    with open(mp, encoding="utf-8") as f:
+        for i, line in enumerate(f, 1):
+            if not line.strip():
+                continue
+            try:
+                r = json.loads(line)
+                if not isinstance(r, dict) or r.get("entry_count") is None or not r.get("merkle_root"):
+                    raise ValueError("缺 entry_count / merkle_root")
+            except Exception as e:
+                err = "Merkle 锚文件第 %d 行读不了：%s" % (i, str(e)[:80])
+                break
+            r["_line"] = i
+            rows.append(r)
+    return rows, err
+
+
+def _anchored_root(count, anchors_path=None):
+    """四字段锚里第 count 条的 root_hash → (root_hash, 错误)。"""
+    arows, aerr = _read_anchors(anchors_path)
+    if aerr:
+        return None, aerr
+    a = next((x for x in arows if x["entry_count"] == int(count)), None)
+    if a is None:
+        return None, "锚文件里没有第 %s 条的签名链头：核验方没有可信链头" % count
+    return a["root_hash"], ""
+
+
+def _merkle_binding(count, anchors_path=None, merkle_path=None):
+    """找「与四字段锚同条数、同 root_hash」的 Merkle 锚 → (记录, 错误)。
+    缺记录 / 签名核不过 / 根对不上，一律报错 —— 不冒充通过。"""
+    root, rerr = _anchored_root(count, anchors_path)
+    if rerr:
+        return None, rerr
+    mrows, merr = _read_merkle_anchors(merkle_path)
+    if merr:
+        return None, merr
+    cands = [r for r in mrows
+             if int(r["entry_count"]) == int(count) and r.get("root_hash") == root]
+    if not cands:
+        return None, "Merkle 锚里没有第 %s 条这条链头的记录（先 anchor 记一笔再答复）" % count
+    rec = cands[-1]                       # 同条数同根的重复记录取最后一条
+    key, kid, all_keys, kerr = _load_keys()
+    if not all_keys:
+        return None, "核验不了 Merkle 锚签名：" + kerr
+    if not _sig_ok(_merkle_payload(rec), rec.get("sig"), all_keys):
+        return None, "第 %s 条的 Merkle 锚签名核不过（这一行事后被动过，或钥不对）" % rec["_line"]
+    return rec, ""
+
+
+def _build_merkle_proof(f_cnt, t_cnt, anchors_path=None, merkle_path=None):
+    """不给行的一致性证明：两枚根取自 Merkle 锚（与四字段锚绑定），节点按 RFC 9162 生成。"""
+    rows = _journal_rows()
+    if t_cnt > len(rows):
+        return None, "本地账只有 %d 行，凑不出 from=%d to=%d 的一致性证明" % (len(rows), f_cnt, t_cnt)
+    t_rec, terr = _merkle_binding(t_cnt, anchors_path, merkle_path)
+    if terr:
+        return None, terr
+    f_root, nodes, perr = "sha256:" + _m_hash(b""), [], ""   # from=0：空树（MTH({}) = HASH()）
+    if f_cnt >= 1:
+        f_rec, ferr = _merkle_binding(f_cnt, anchors_path, merkle_path)
+        if ferr:
+            return None, ferr
+        f_root = f_rec["merkle_root"]
+        nodes, perr = merkle_consistency_proof(rows, f_cnt, t_cnt)
+        if perr:
+            return None, perr
+    return {"algo": MERKLE_ALGO, "kind": "consistency",
+            "from_count": f_cnt, "to_count": t_cnt,
+            "from_root": f_root, "to_root": t_rec["merkle_root"], "nodes": nodes}, ""
+
+
+def _check_merkle_proof(proof, anchors_path=None, merkle_path=None):
+    """复算「不给行」的证明：两枚根必须与锚绑定得上，再按 RFC 9162 §2.1.4.2 走一遍。"""
+    try:
+        f_cnt, t_cnt = int(proof.get("from_count")), int(proof.get("to_count"))
+    except (TypeError, ValueError):
+        return False, "证明里没有 from_count / to_count"
+    if f_cnt < 0 or t_cnt <= f_cnt:
+        return False, "口径要求 0 <= from < to（收到 from=%s to=%s）" % (f_cnt, t_cnt)
+    nodes = proof.get("nodes")
+    if not isinstance(nodes, list):
+        return False, "证明里没有 nodes：这不是 Merkle 一致性证明"
+    t_rec, terr = _merkle_binding(t_cnt, anchors_path, merkle_path)
+    if terr:
+        return False, terr
+    if proof.get("to_root") and _strip_sha(proof["to_root"]) != _strip_sha(t_rec["merkle_root"]):
+        return False, "证明里的 to 端根与 Merkle 锚对不上"
+    if f_cnt == 0:
+        # 空前缀与任何账都一致（RFC 的算法从 0 < first 起）：只核 to 端的锚，节点必须是空的
+        if nodes:
+            return False, "from=0 是空前缀，不该带节点（收到 %d 个）" % len(nodes)
+        if proof.get("from_root") and _strip_sha(proof["from_root"]) != _m_hash(b""):
+            return False, "from=0 的根不是空树哈希"
+        return True, "from=0：空前缀与任何账都一致（to 端的 Merkle 锚签名核过）"
+    f_rec, ferr = _merkle_binding(f_cnt, anchors_path, merkle_path)
+    if ferr:
+        return False, ferr
+    if proof.get("from_root") and _strip_sha(proof["from_root"]) != _strip_sha(f_rec["merkle_root"]):
+        return False, "证明里的 from 端根与 Merkle 锚对不上"
+    return check_merkle_consistency(f_cnt, t_cnt, f_rec["merkle_root"], t_rec["merkle_root"], nodes)
+
+
 # ── 一致性证明挑战单（challenges.jsonl，append-only 事件流）────────────────
 # 外部审计当场追的那一问（deadline 定多久 / 判失败前留存什么）在这里给代码级答案：
 #   deadline 默认 300 秒（V2_PROOF_DEADLINE 覆盖）；理由与改法写在 README。
@@ -739,10 +1018,10 @@ def challenge_deliver(request_id, path=None, at=None):
 
 
 def _build_proof(f_cnt, t_cnt):
-    """一致性证明本体：两端链头 + 中间的行 + 中间的影子链哈希。
+    """一致性证明本体（带行的形态）：两端链头 + 中间的行 + 中间的影子链哈希。
 
     核验方拿 from 端的链头，逐行重算到 to 端，必须落在答复里的 head_to 上。
-    CT 那种不给行也能验的 Merkle 一致性证明还没做（边界照实写）。
+    不想给行的场合走 _build_merkle_proof（RFC 9162，见上一段）。
     """
     rows = _journal_rows()
     if t_cnt > len(rows):
@@ -761,8 +1040,15 @@ def _build_proof(f_cnt, t_cnt):
     return proof, ""
 
 
-def check_proof(proof):
-    """复算一致性证明：从 head_from 逐行算到 head_to，链段必须步步对上。返回 (ok, why)。"""
+def check_proof(proof, anchors_path=None, merkle_path=None):
+    """复算一致性证明，两种形态都认：
+      · 带 rows 的老形态 —— 从 head_from 逐行算到 head_to，链段必须步步对上；
+      · 带 nodes 的 Merkle 形态（不给行）—— 两枚根必须与 Merkle 锚绑定得上，
+        再按 RFC 9162 §2.1.4.2 复算 O(log n) 个中间节点；锚缺了就报「验不了」。
+    返回 (ok, why)。"""
+    if isinstance(proof, dict) and ("nodes" in proof
+                                    or str(proof.get("algo") or "").startswith(MERKLE_ALGO)):
+        return _check_merkle_proof(proof, anchors_path, merkle_path)
     try:
         if not isinstance(proof, dict):
             return False, "答复里没有证明"
@@ -787,8 +1073,12 @@ def check_proof(proof):
         return False, "证明复算出错：%s" % str(e)[:80]
 
 
-def challenge_respond(request_id, path=None, at=None):
+def challenge_respond(request_id, path=None, at=None, merkle_only=False):
     """日志方答复：附一致性证明、签名后追加（append-only）。
+
+    merkle_only=True → 只给 Merkle 一致性证明（**一个原始行都不给**）：
+    两枚根必须已经在 merkle.jsonl 里签好名，凑不出就如实报错、不写答复。
+    默认（merkle_only=False）给带行的老形态，老核验照旧。
 
     凑不出证明（本地账不够 to 条）就如实报错、不写答复 —— 那种情况下
     超时判定仍按 challenges.jsonl 里的回执字段走，不由这里说了算。
@@ -803,7 +1093,10 @@ def challenge_respond(request_id, path=None, at=None):
             return {"ok": False, "path": cp, "why": "没有这张挑战单：%s" % request_id}
         if v["response"] is not None:
             return {"ok": False, "path": cp, "why": "已答复过（append-only，不重复记）：%s" % request_id}
-        proof, perr = _build_proof(int(v["from_count"]), int(v["to_count"]))
+        if merkle_only:
+            proof, perr = _build_merkle_proof(int(v["from_count"]), int(v["to_count"]))
+        else:
+            proof, perr = _build_proof(int(v["from_count"]), int(v["to_count"]))
         if perr:
             return {"ok": False, "path": cp, "why": perr}
         key, kid, all_keys, kerr = _load_keys()
@@ -1160,12 +1453,29 @@ if __name__ == "__main__":
         print(json.dumps(_r, ensure_ascii=False))
         sys.exit(0 if _r.get("ok") else 1)
     elif _args and _args[0] in ("challenge-deliver", "challenge-respond"):
-        # challenge-deliver <request_id> → 送达回执（判失败前必须留存）
-        # challenge-respond <request_id> → 日志方答复（附一致性证明）
+        # challenge-deliver <request_id>                  → 送达回执（判失败前必须留存）
+        # challenge-respond <request_id>                  → 日志方答复（带行的老形态）
+        # challenge-respond <request_id> --merkle-only    → 答复只给 Merkle 证明（一个原始行都不给）
+        def _ticket_id(argv):
+            """取 request_id：跳过 --path 的取值，也跳过不带取值的开关（如 --merkle-only）。"""
+            out, skip = [], False
+            for a in argv[1:]:
+                if skip:
+                    skip = False
+                    continue
+                if a == "--path":
+                    skip = True
+                    continue
+                if a.startswith("--"):
+                    continue
+                out.append(a)
+            return out[0] if out else None
         _p = _after(_args, "--path")
-        _rid = _first_positional(_args)
-        _fn = challenge_deliver if _args[0] == "challenge-deliver" else challenge_respond
-        _r = _fn(_rid, path=_p)
+        _rid = _ticket_id(_args)
+        if _args[0] == "challenge-deliver":
+            _r = challenge_deliver(_rid, path=_p)
+        else:
+            _r = challenge_respond(_rid, path=_p, merkle_only="--merkle-only" in _args)
         print(json.dumps(_r, ensure_ascii=False))
         sys.exit(0 if _r.get("ok") else 1)
     elif _args and _args[0] == "challenge-status":

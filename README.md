@@ -97,6 +97,21 @@ python V2/v2_gate.py challenge-status ch-…      # 查单（不带单号 = 全�
 
 `challenge-status` 的状态口径：缺回执 → `undelivered`，**不判失败**（退出码 0）；有回执 + 过了 `issued_at + deadline` + 没答复 → `timeout` = 拒绝证明（退出码 1），**这张单据本身就是收据**；已答复 → `answered`（证明当场复算），过了期限才答复 → `answered_late`（留痕，不等于拒绝）。请求单、回执、答复的签名任一核不过 → 报红，不静默。
 
+### 不给行也能验的一致性证明（Merkle，v3.3 补齐）
+
+挑战单的答复有两种形态，日志方自己选，**核验方只认复算结果**：
+
+```bash
+python V2/v2_gate.py challenge-respond ch-… --merkle-only   # 只给 Merkle 证明：一个原始行都不给
+python V2/v2_gate.py challenge-status ch-…                  # 照旧复算；过 = answered，不过 = bad_proof
+```
+
+- **树形按 RFC 9162 §2.1.1**：叶子 = 该行规范化 JSON 的 `sha256(0x00‖行)`，节点 = `sha256(0x01‖左‖右)`，`n>1` 时取小于 `n` 的最大 2 的幂劈开 —— 树形只由条数决定，两边各自算出来的根必然同形；
+- **可信根从哪来**：`anchor` 在写四字段锚的同一刻，把同一条数、同一 `root_hash` 的 Merkle 根**签名**追加进 `merkle.jsonl`（append-only，`V2_MERKLE` 可挪位置）；核验方拿这两枚锚当可信根，按 RFC 9162 §2.1.4.2 复算证明里的 O(log n) 个中间节点；
+- **绑定**：Merkle 记录必须与四字段锚**同条数、同 `root_hash`** 才参与核验；同条数异根的记录不采信，分叉检测仍归 `check-anchors` 的 equivocation 自检；
+- **四字段锚一个字节没改**：老锚、老答复（带行的）照旧核得过；
+- **前提与边界照实说**：`from` 与 `to` 两个条数都得锚过 —— 没锚过的条数给不出 Merkle 答复（如实报错、不写答复，带行的老形态照旧能答）；`from=0` 是空前缀，本来就一致，核验只看 `to` 端的锚；`merkle.jsonl` 缺记录就报「验不了」，**不冒充通过**；它与锚同机同盘，流水 + 链 + 锚 + Merkle 锚一起改写的共谋仍在边界之外。
+
 ### 时间线：最近 N 节（v3.1 新增）
 
 ```python
@@ -204,7 +219,7 @@ print(B.borrow(key, msg="今天天气怎么样"))                        # 借�
 
 ```
 V2/                     账本件
-  v2_gate.py            记账闸：入账、翻案、哈希链校验、链头锚定与签名链头（chain-head / anchor / verify --against / check-anchors）、一致性证明挑战单（challenge / challenge-status）；账目录走 V2_STATE_DIR
+  v2_gate.py            记账闸：入账、翻案、哈希链校验、链头锚定与签名链头（chain-head / anchor / verify --against / check-anchors）、一致性证明挑战单（challenge / challenge-status / challenge-respond --merkle-only，Merkle 锚在 merkle.jsonl）；账目录走 V2_STATE_DIR
   v2_gate/ledger.py     账本本体：追加、借票、锁、压实、按钟忘、归档、时间线 recent(n)
   v2_borrow.py          只读借账：翻目录 / 快扫 / 单笔借回，不改判决
   v2_mcp_server.py      MCP 工具表（record / borrow），自检在 --selftest
@@ -225,7 +240,7 @@ docs/                   发布 SOP 与引用位
 payout_address_proof.txt   收款地址归属证明：地址、仓库、公开指纹与三步核验
 .github/workflows/      CI（先本地跑，不推远端不算对外）
 ci/run_ci.py            本地 CI：编译 + 自测 + 沙箱冒烟 + 验收用例 + 去业务扫描
-tests/                  验收用例（unittest，纯标准库）：链头锚定 / 签名链头与挑战单 / 时间线 recent(n) / 半行残尾自愈
+tests/                  验收用例（unittest，纯标准库）：链头锚定 / 签名链头与挑战单 / Merkle 一致性证明 / 时间线 recent(n) / 半行残尾自愈
 examples/               对账挑战样例：链头四字段复算与比对 chain_head.py、样例流水与样例链头
 ```
 
@@ -240,6 +255,7 @@ examples/               对账挑战样例：链头四字段复算与比对 chai
 | `V2_ANCHOR_KEY_FILE` | 放签名密钥的文件路径（文件里只有密钥本身） | 无 |
 | `V2_ANCHOR_KEYS` | 轮换留下的旧密钥（逗号分隔），只用来核验历史单据 | 无 |
 | `V2_CHALLENGES` | 一致性证明挑战单文件路径（append-only） | 账目录下的 `challenges.jsonl` |
+| `V2_MERKLE` | Merkle 锚文件路径（与四字段锚同条数同根，给「不给行也能验」的核验用，append-only） | 账目录下的 `merkle.jsonl` |
 | `V2_PROOF_DEADLINE` | 一致性证明的 deadline（秒），非法值直接报错 | `300` |
 | `V3_SCRIPTS_DIR` | 体检脚本去哪找标准件 | `%LOCALAPPDATA%\hermes\scripts` |
 | `HERMES_CONFIG` | 宿主配置路径（查接线，缺场记 SKIP） | `%LOCALAPPDATA%\hermes\config.yaml` |
@@ -258,8 +274,8 @@ examples/               对账挑战样例：链头四字段复算与比对 chai
 - **默认不联网**：起念件只有在显式配了端点与密钥时才调模型，密钥只从环境变量读，不入库、不回显。
 - **三本账**：判决流水 `journal.jsonl`、快照 `ledger.json`、过期归档 `expired.jsonl`，全在 `V2_STATE_DIR` 下。
 - **链头锚定（v3.1 起）**：`anchor` 把链头（条数 + sha256 摘要 + 时刻）追加写进**本地锚文件** `anchors.jsonl`（默认与账同目录，`V2_ANCHORS` 挪到独立位置更顶用），`verify --against` 拿本地链头对历史锚，抓得出**尾部被截断**。
-  **边界照实说**：外部第三方时间戳锚定（把链头发到链外 / 第三方）**还没做** —— 账被当证据用的时候才需要那一层；同盘的流水 + 链 + 锚一起改写的共谋，也仍在边界之外。
-- **签名链头与挑战单（v3.2 起）**：锚与挑战单用 HMAC-SHA256 签名，密钥只从环境变量 / 文件读；**对称签名的强度上限是「持钥方就能签」**，所以钥要放在写者之外的核验方手里，这一层的边界照实说。同盘的流水 + 链 + 锚 + 挑战单一起改写的共谋、外部第三方时间戳、见证者互看（gossip，要外部方）、不给行也能验的 Merkle 一致性证明 —— **都还没做**。
+  **边界照实说**：**v3.3 起有一层弱外部锚** —— 发布时把签名链头（四字段 + 签名）原样写进 GitHub Release 说明与带注 tag，账外有了第二份、由仓库托管方持有，本地改盘对不上它；边界照实说到底：托管方是我们也能影响的一方，**权威第三方时间戳（RFC 3161 那类）还没做** —— 账被当证据用的时候才需要那一层；同盘的流水 + 链 + 锚一起改写的共谋，也仍在边界之外。
+- **签名链头与挑战单（v3.2 起）**：锚与挑战单用 HMAC-SHA256 签名，密钥只从环境变量 / 文件读；**对称签名的强度上限是「持钥方就能签」**，所以钥要放在写者之外的核验方手里，这一层的边界照实说。同盘的流水 + 链 + 锚 + 挑战单 + Merkle 锚一起改写的共谋、权威第三方时间戳（弱形态见链头锚定那条，权威版**还没做**）、见证者互看（gossip，要外部方）—— **都还没做**；不给行也能验的 Merkle 一致性证明已补齐（见上一节），它的前提是两个条数都锚过。
 
 ## 给 Agent 的对账挑战
 
@@ -327,5 +343,5 @@ python examples/chain_head.py --journal examples/sample_journal.jsonl --expect e
 
 ## 发布
 
-当前发布 tag：**v3.2**（版本号见 `V2/v2_gate.py` 的 `__version__`，中英 README 与 docs 同步）。
+当前发布 tag：**v3.3**（版本号见 `V2/v2_gate.py` 的 `__version__`，中英 README 与 docs 同步）。
 对外推送前先走 `docs/RELEASE.md` 的四门槛核对清单与公告模板；清单没全勾，一条都不发。

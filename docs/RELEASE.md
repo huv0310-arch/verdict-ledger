@@ -4,6 +4,7 @@
 > 旁注：窗口已定稿（见上行）；备选 11-08 未启用。
 > 旁注 2（2026-11-07）：**v3.1 经维护方批准发布，冻结期结束** —— 本次只收录已带验收用例的迭代项（时间线 recent(n)、半行残尾自愈），其余仍在验证中。
 > 旁注 3（2026-11-07）：**v3.2 发布指示** —— 收下外部审计当场戳中的四条：签名链头（entry_count / root_hash / issued_at / key_id + 签名）、新锚必须是旧锚的 append-only 延伸、同条数异根的 equivocation 报警、一致性证明挑战单（签名请求单 + 送达回执 + 书面 deadline）；witness / gossip 挂账不施工。
+> 旁注 4（2026-11-09）：**v3.3 发布指示（维护方已批"按操作来、补全缺的、更新提交"）** —— ①补齐「不给行也能验」的 Merkle 一致性证明（RFC 9162 §2.1.1 树形 + §2.1.4.2 复算，与四字段锚同条数同根绑定，签名根进 `merkle.jsonl`，`challenge-respond --merkle-only` 零行答复）；②边界节改为「弱外部锚已做（签名链头随 Release 说明与带注 tag 托管在仓库方），权威第三方时间戳仍未做」；③本次发布动作：push + tag v3.3 + **创建 GitHub Release（大众件），Release 说明带现役账本签名链头四字段**（只出门四个数，内容不出门 —— 隐私四闸口径 2026-11-09 维护方已确认"条数露着、内容死活不出门"）；witness / gossip / 非对称签名（国密位）继续挂账不施工。
 
 本文件是**唯一**的对外动作闸门。清单没全勾：不 push、不发公告、不发任何对外消息。
 （发布准备阶段允许的 git 动作只有本机 `git add` / `git commit`，且只在私仓区。）
@@ -38,12 +39,13 @@ python V2/v2_mcp_server.py --selftest                 # 临时账端到端
 - [x] 2026-11-06 复检：README+docs+V2/V3 源码 正则扫 密钥/本地路径/公司名 = 0 命中；CI debiz 扫描 0 残留
 - [x] 2026-11-07 复检（v3.1）：`python ci/run_ci.py` = ALL GREEN（8 步：编译 + 4 个自测 + 沙箱冒烟 + 体检 + 验收用例 18 条 + debiz 0 残留）；`git tag -l` 见 v3.1
 - [x] 2026-11-07 复检（v3.2）：`python ci/run_ci.py` = ALL GREEN（8 步：编译 + 4 个自测 + 沙箱冒烟 + 体检 + 验收用例 35 条（含同条数异根报警 / 缺回执不判失败 / 老格式锚行可读 / deadline 超时判定）+ debiz 0 残留）；黑话扫描按新增行 0 命中；`git tag -l` 见 v3.2
+- [x] 2026-11-09 复检（v3.3）：`python ci/run_ci.py` = ALL GREEN（8 步：编译 + 4 个自测 + 沙箱冒烟 + 体检 + 验收用例 50 条（新增 Merkle 15 条：独立实现对拍 / RFC 9162 七叶例 / 每个前缀对可验 / 篡改截断报红 / 与四字段锚绑定不符不采信 / 缺锚如实拒绝且不写答复 / 零行答复端到端可验）+ debiz 0 残留 = 隐私闸过）；`git tag -l` 见 v3.3
 - [ ] 纪念章：四门槛全勾 + 维护方确认后，正本按 `docs/纪念章规格.md` 落库（未确认则保持引用位，发布说明按引用写法「规格由维护方保管」）
 
 ## 三、push（四门槛全勾之后才执行）
 
 ```bash
-git add -A && git commit -m "release: v3.2"
+git add -A && git commit -m "release: v3.3"
 git remote add origin <仓库地址>          # 首次
 git push -u origin main                   # 只在这一步之后才算"对外"
 ```
